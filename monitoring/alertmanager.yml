@@ -1,0 +1,6 @@
+route:
+  receiver: "log"
+receivers:
+- name: "log"
+  webhook_configs:
+  - url: "http://prometheus:9090/-/healthy"
