@@ -1,11 +1,13 @@
-pipeline {
-  agent any   // ← was: agent { label 'docker' }
+\pipeline {
+  agent any
 
   options {
     timestamps()
   }
 
   environment {
+    // Ensure Docker binaries are reachable on macOS (Docker Desktop install paths)
+    PATH         = "/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     REGISTRY     = 'ghcr.io'
     IMAGE_REPO   = 'akrobe/discountmate'
     IMAGE        = "${REGISTRY}/${IMAGE_REPO}"
@@ -37,10 +39,21 @@ pipeline {
       steps {
         sh '''
           set -eux
-          which docker
-          docker --version
+          # 1) CLI present?
+          command -v docker
+
+          # 2) Daemon running?
           docker version
-          docker compose version || { echo "Docker Compose v2 is required"; exit 1; }
+
+          # 3) Compose v2 present? Try to help if not.
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "Compose plugin not found; attempting to link it into ~/.docker/cli-plugins/ ..."
+            mkdir -p "$HOME/.docker/cli-plugins"
+            if [ -f "/Applications/Docker.app/Contents/Resources/cli-plugins/docker-compose" ]; then
+              ln -sf "/Applications/Docker.app/Contents/Resources/cli-plugins/docker-compose" "$HOME/.docker/cli-plugins/docker-compose"
+            fi
+          fi
+          docker compose version
           docker buildx version || true
         '''
       }
@@ -53,7 +66,9 @@ pipeline {
             set -eux
             echo "$PAT" | docker login ghcr.io -u akrobe --password-stdin
 
+            # Ensure a builder exists that can do multi-arch
             docker buildx create --name dm_builder --use || docker buildx use dm_builder || true
+            docker buildx inspect --bootstrap || true
 
             docker buildx build \
               --platform linux/amd64,linux/arm64 \
@@ -94,10 +109,10 @@ pipeline {
         sh '''
           set -eux
           docker rm -f dm_svc || true
-
           APP_PORT=8088
           docker run -d --rm --name dm_svc -p ${APP_PORT}:8080 ${IMAGE}:${VERSION}
 
+          # simple health gate
           for i in $(seq 1 30); do
             curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1
           done
@@ -127,6 +142,7 @@ pipeline {
           set +e
           mkdir -p reports
 
+          # Static code + dep vulns
           docker run --rm -v "$WORKSPACE":/src python:3.12-slim sh -lc '
             pip install --no-cache-dir bandit pip-audit >/dev/null 2>&1 && \
             cd /src && \
@@ -134,6 +150,7 @@ pipeline {
             pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
           '
 
+          # Image scan (ask specifically for a platform we built)
           docker run --rm aquasec/trivy:latest image \
             --platform linux/amd64 \
             --scanners vuln \
@@ -142,10 +159,6 @@ pipeline {
             --no-progress \
             ${IMAGE}:${VERSION} | tee reports/trivy.txt
           TRIVY_CODE=${PIPESTATUS[0]}
-
-          python3 - <<'PY'
-print("Bandit HIGH:", 0)
-PY
 
           if [ "$TRIVY_CODE" -eq 1 ]; then
             echo "Trivy found CRITICAL vulnerabilities"; exit 1
@@ -166,8 +179,8 @@ PY
           set -eux
           export ENV_FILE=env/.env.staging
           [ -f "${ENV_FILE}" ] || (echo "Missing ${ENV_FILE}" && exit 1)
-
           export IMAGE=${IMAGE}:${VERSION}
+
           docker compose -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile staging up -d
 
           . ${ENV_FILE}
