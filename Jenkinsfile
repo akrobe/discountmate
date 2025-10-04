@@ -1,10 +1,8 @@
-pipeline {
-  // Make sure your Jenkins node that has Docker & Compose is labeled "docker"
-  agent { label 'docker' }
+\pipeline {
+  agent any   // ← was: agent { label 'docker' }
 
   options {
     timestamps()
-    // ansiColor removed to avoid "Invalid option type" error on instances without the plugin
   }
 
   environment {
