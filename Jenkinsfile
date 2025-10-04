@@ -75,9 +75,9 @@ stage('Docker Sanity') {
 
       # ---- Unit tests (mount workspace so requirements-dev.txt & tests are visible) ----
       if [ -f requirements-dev.txt ] && [ -d tests ]; then
-        docker run --rm -v "$PWD":/workspace -w /workspace ${IMAGE_TAG} \
-          sh -lc "pip install -r requirements-dev.txt && \
-                  pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py"
+        docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace ${IMAGE_TAG} \
+  sh -lc "pip install -r requirements-dev.txt && \
+          pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py"
       else
         echo "No tests yet; skipping unit tests (will run smoke in integration block)…"
       fi
@@ -89,9 +89,9 @@ stage('Docker Sanity') {
 
       # ---- Integration tests (hit the service via host port; use host.docker.internal inside container) ----
       if [ -f requirements-dev.txt ] && [ -f tests/test_integration_api.py ]; then
-        docker run --rm -v "$PWD":/workspace -w /workspace -e BASE_URL=http://host.docker.internal:8088 ${IMAGE_TAG} \
-          sh -lc "pip install -r requirements-dev.txt && \
-                  pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py"
+        docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace -e BASE_URL=http://host.docker.internal:8088 ${IMAGE_TAG} \
+  sh -lc "pip install -r requirements-dev.txt && \
+          pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py"
       else
         echo "No integration tests; doing smoke check instead…"
         curl -sf http://localhost:8088/health > /dev/null
