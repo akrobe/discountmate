@@ -3,10 +3,13 @@ pipeline {
   options { timestamps() }
 
   environment {
-    REGISTRY     = 'ghcr.io'
-    OWNER        = 'akrobe'
-    IMAGE_NAME   = 'discountmate'
-    IMAGE        = "${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+    // ---- Make Docker CLI visible to Jenkins regardless of launch PATH
+    PATH = "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
+
+    REGISTRY   = 'ghcr.io'
+    OWNER      = 'akrobe'
+    IMAGE_NAME = 'discountmate'
+    IMAGE      = "${REGISTRY}/${OWNER}/${IMAGE_NAME}"
     COMPOSE_FILE = 'compose.yaml'
   }
 
@@ -35,10 +38,24 @@ pipeline {
       steps {
         sh '''
           set -eux
-          command -v docker
+          echo "PATH is: $PATH"
+
+          # 1) CLI must be present
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "ERROR: docker CLI not found in PATH."
+            echo "Checked /usr/local/bin, /opt/homebrew/bin and /Applications/Docker.app/Contents/Resources/bin"
+            ls -l /Applications/Docker.app/Contents/Resources/bin || true
+            exit 2
+          fi
+
+          # 2) Docker Desktop must be running (daemon reachable)
           docker version
+          docker info >/dev/null
+
+          # 3) Compose & buildx available
           docker compose version
-          docker buildx version
+          docker buildx version || true
+
           # Ensure a usable buildx builder
           docker buildx inspect ci-builder >/dev/null 2>&1 || docker buildx create --name ci-builder --driver docker-container --use
           docker buildx inspect --bootstrap
@@ -51,7 +68,7 @@ pipeline {
         script {
           def loggedIn = false
 
-          // First try Secret Text credential: ghcr_pat
+          // Prefer a Secret Text called ghcr_pat (PAT with write:packages)
           try {
             withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
               sh '''
@@ -61,11 +78,11 @@ pipeline {
               loggedIn = true
               echo "Logged in to GHCR using ghcr_pat"
             }
-          } catch (e) {
+          } catch (ignore) {
             echo "No 'ghcr_pat' credential found; will try 'github-https'…"
           }
 
-          // Fallback: use username/password (your existing github-https)
+          // Fallback to your existing username/password credential
           if (!loggedIn) {
             try {
               withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
@@ -76,12 +93,12 @@ pipeline {
                 loggedIn = true
                 echo "Logged in to GHCR using github-https"
               }
-            } catch (e2) {
+            } catch (ignore2) {
               echo "No usable GHCR creds; will build locally and skip push."
             }
           }
 
-          // Build & load single-arch image for local testing
+          // Build a local image (single-arch) for tests
           sh """
             set -eux
             docker buildx build \
@@ -91,7 +108,7 @@ pipeline {
               -f Dockerfile .
           """
 
-          // If we could login, build and push a proper multi-arch image
+          // If logged in, build & push multi-arch
           if (loggedIn) {
             sh """
               set -eux
@@ -161,7 +178,7 @@ pipeline {
             pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
           '
 
-          # Trivy: scan the locally loaded image; mount Docker socket so Trivy can see it
+          # Scan local image via Docker socket
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD"/reports:/reports \
