@@ -1,15 +1,64 @@
+version: "3.9"
+
+# Note: Jenkins sets IMAGE env (e.g., ghcr.io/akrobe/discountmate:2025.10.04-12-abc123)
+# and uses --env-file env/.env.staging so APP_PORT, etc, come from there.
+
 services:
-  api:
+  discountmate:
     image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}
-    container_name: dm_staging
-    profiles: ["staging"]
+    container_name: discountmate
+    env_file:
+      - ${ENV_FILE}
     ports:
-      - "${STAGING_HOST_PORT:-8089}:8080"
-    environment:
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+      - "${APP_PORT:-8088}:8080"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
       interval: 5s
       timeout: 2s
-      retries: 12
+      retries: 20
+    restart: unless-stopped
+    profiles: ["staging"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    profiles: ["staging"]
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+    profiles: ["staging"]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./monitoring/grafana/provisioning/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./monitoring/grafana/provisioning/dashboards/discountmate-dashboard.json:/var/lib/grafana/dashboards/discountmate-dashboard.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles: ["staging"]
+
+volumes:
+  prom_data: {}
+  grafana_data: {}
