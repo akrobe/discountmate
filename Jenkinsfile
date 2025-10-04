@@ -5,16 +5,15 @@ pipeline {
     timestamps()
   }
 
-  parameters {
-    booleanParam(name: 'DO_SONAR', defaultValue: false, description: 'Enable SonarQube analysis + Quality Gate')
-  }
 
 environment {
   APP_NAME = 'discountmate'
   REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"
   IMAGE_BASENAME = "${REGISTRY}/${APP_NAME}"
-  // Add Docker CLI locations for macOS (Intel + Apple Silicon) + standard paths
   PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+  // Sonar toggle via env var (default off)
+  DO_SONAR = "${env.DO_SONAR ?: 'false'}"
 }
 
   stages {
@@ -107,8 +106,8 @@ stage('Docker Sanity') {
   }
 }
 
-    stage('Code Quality (SonarQube)') {
-      when { expression { return params.DO_SONAR } }
+stage('Code Quality (SonarQube)') {
+  when { expression { return env.DO_SONAR?.toBoolean() } }
       steps {
         withSonarQubeEnv('SonarQube') {
           sh '''
@@ -126,8 +125,8 @@ stage('Docker Sanity') {
       }
     }
 
-    stage('Quality Gate') {
-      when { expression { return params.DO_SONAR } }
+stage('Quality Gate') {
+  when { expression { return env.DO_SONAR?.toBoolean() } }
       steps {
         timeout(time: 15, unit: 'MINUTES') {
           waitForQualityGate abortPipeline: true
