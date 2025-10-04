@@ -1,0 +1,11 @@
+groups:
+  - name: discountmate.rules
+    rules:
+      - alert: DiscountmateDown
+        expr: up{job="discountmate"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "discountmate target is down"
+          description: "No scrape data for {{ $labels.instance }} for >1m"

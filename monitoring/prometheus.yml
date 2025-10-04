@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+scrape_configs:
+  - job_name: 'discountmate'
+    static_configs:
+      - targets:
+          - 'host.docker.internal:8088'  # staging
+          - 'host.docker.internal:80'    # production
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
