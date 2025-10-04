@@ -100,7 +100,6 @@ docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IM
   pytest -q \
     --junitxml=reports/junit.xml \
     --cov=app --cov-report=xml:reports/coverage.xml --cov-report=html:reports/htmlcov \
-    --cov-fail-under=80 \
     tests/test_unit_*.py
 '
 '''
@@ -124,7 +123,7 @@ HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
 for i in $(seq 1 30); do curl -fsS "http://localhost:$HOST_PORT/health" && break || sleep 1; done
 docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace -e BASE_URL="http://host.docker.internal:${HOST_PORT}" ${IMAGE_REPO}:${VERSION}-local sh -lc '
   pip install -r requirements.txt -r requirements-dev.txt &&
-  pytest -q --junitxml=reports/junit-it.xml tests/test_integration_*.py
+  pytest -q --junitxml=reports/junit-it.xml \ --cov=app --cov-append \ --cov-report=xml:reports/coverage.xml \ --cov-report=html:reports/htmlcov \ --cov-fail-under=80 \ tests/test_integration_*.py
 '
 docker rm -f dm_svc || true
 '''
