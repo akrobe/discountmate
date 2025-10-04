@@ -179,10 +179,10 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src" aqua
       when { expression { return params.DEPLOY_STAGING } }
       steps {
         sh '''set -eux
-echo "APP_PORT=8080" > env/.env.staging
-export IMAGE=${IMAGE_REPO}:${VERSION}
+APP_PORT="$(awk -F= '/^APP_PORT=/{print $2}' env/.env.staging || echo 8081)"
+export IMAGE="ghcr.io/akrobe/discountmate:${VERSION}"
 docker compose -f docker-compose.yml --env-file env/.env.staging --profile staging up -d discountmate
-for i in $(seq 1 30); do curl -sf http://localhost:8080/health && break || sleep 1; done
+for i in $(seq 1 30); do curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1; done
 '''
       }
     }
