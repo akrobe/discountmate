@@ -1,4 +1,4 @@
-\pipeline {
+pipeline {
   agent any   // ← was: agent { label 'docker' }
 
   options {
