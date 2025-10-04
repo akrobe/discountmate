@@ -97,7 +97,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
       steps {
         sh '''set -eux
 mkdir -p reports
-docker run --rm -v "${env.WORKSPACE}:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IMAGE_REPO}:${VERSION}-local sh -lc '
+docker run --rm -v "$WORKSPACE:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IMAGE_REPO}:${VERSION}-local sh -lc '
   pip install -r requirements.txt -r requirements-dev.txt &&
   pytest -q \
     --junitxml=reports/junit.xml \
@@ -128,7 +128,7 @@ HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
 for i in $(seq 1 30); do curl -fsS "http://localhost:$HOST_PORT/health" && break || sleep 1; done
 
 docker run --rm \
-  -v "${env.WORKSPACE}:/workspace" -w /workspace \
+  -v "$WORKSPACE:/workspace" -w /workspace \
   -e PYTHONPATH=/workspace \
   -e BASE_URL="http://host.docker.internal:${HOST_PORT}" \
   ${IMAGE_REPO}:${VERSION}-local sh -lc "
@@ -151,7 +151,7 @@ docker rm -f dm_svc || true
         // Bandit (non-blocking, high severity only)
         sh '''set -eux
 mkdir -p reports
-docker run --rm -v "${env.WORKSPACE}:/src" python:3.12-slim sh -lc '
+docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
   pip install --no-cache-dir bandit && cd /src &&
   bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high || true
 '
