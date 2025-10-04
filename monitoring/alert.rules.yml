@@ -1,11 +1,11 @@
 groups:
-  - name: discountmate.rules
-    rules:
-      - alert: DiscountmateDown
-        expr: up{job="discountmate"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "discountmate target is down"
-          description: "No scrape data for {{ $labels.instance }} for >1m"
+- name: app
+  rules:
+  - alert: AppDown
+    expr: probe_success == 0
+    for: 30s
+    labels:
+      severity: critical
+    annotations:
+      summary: "App health probe failing"
+      description: "Blackbox probe to /health on {{ $labels.instance }} is failing."
