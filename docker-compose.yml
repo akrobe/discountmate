@@ -25,7 +25,6 @@ services:
     profiles: ["monitoring","prod"]
     restart: unless-stopped
 
-  services:
   discountmate:
     image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}
     container_name: discountmate
