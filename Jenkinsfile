@@ -3,23 +3,19 @@ pipeline {
   options {
     buildDiscarder(logRotator(numToKeepStr: '20'))
     timestamps()
-    ansiColor('xterm')
   }
 
   parameters {
-    // Turn Sonar on once you’ve configured SonarQube in Jenkins → Manage Jenkins → System.
     booleanParam(name: 'DO_SONAR', defaultValue: false, description: 'Enable SonarQube analysis + Quality Gate')
   }
 
   environment {
     APP_NAME = 'discountmate'
-    // If you set Manage Jenkins → System → Global properties → GIT_USERNAME, this will use it.
-    REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"
+    REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"   // change if needed
     IMAGE_BASENAME = "${REGISTRY}/${APP_NAME}"
   }
 
   stages {
-
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -54,7 +50,6 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # If dev reqs/tests are missing (early scaffolding), fall back to a smoke check.
           if [ -f requirements-dev.txt ] && [ -d tests ]; then
             docker run --rm --name dm_unit ${IMAGE_TAG} \
               sh -lc "pip install -r requirements-dev.txt && \
@@ -72,7 +67,6 @@ pipeline {
             sleep 3
             curl -sf http://localhost:8088/health > /dev/null
             docker stop dm_smoke
-            # NOTE: add tests later for HD rubric; this just gets you unblocked.
           fi
         '''
       }
@@ -142,7 +136,6 @@ PY
           export ENV_FILE=env/.env.staging
           export IMAGE=${IMAGE_TAG}
           docker compose --env-file ${ENV_FILE} --profile staging up -d
-          # health gate on staging port
           for i in $(seq 1 30); do
             curl -sf http://localhost:8081/health && break || sleep 2
           done
@@ -165,7 +158,6 @@ PY
             export IMAGE=${IMAGE_BASENAME}:prod
             docker compose --env-file ${ENV_FILE} --profile prod up -d
 
-            # quick smoke on port 80
             for i in $(seq 1 30); do
               curl -sf http://localhost/health && break || sleep 2
             done
@@ -181,15 +173,21 @@ PY
     stage('Monitoring & Alerting (demo)') {
       steps {
         sh '''
-          # create some traffic + a simulated error (Alertmanager should fire)
           curl -s -XPOST http://localhost:8081/recommend -H 'content-type: application/json' \
                -d '{"total":220,"items":5,"tier":"silver"}' > /dev/null || true
           curl -s -XPOST http://localhost:8081/simulate_error > /dev/null || true
 
-          # wait for rules to evaluate, then capture alerts
           sleep 70
-          curl -sf http://localhost:9093/api/v2/alerts > reports/alerts.json || true
-          test -s reports/alerts.json || (echo 'No alerts returned'; exit 1)
+          curl -sf http://localhost:9093/api/v2/alerts -o reports/alerts.json || true
+          python3 - <<'PY'
+import json, sys
+try:
+  data=json.load(open('reports/alerts.json'))
+  ok=any(a.get('labels',{}).get('alertname')=='DiscountmateErrors' for a in data)
+  sys.exit(0 if ok else 1)
+except Exception:
+  sys.exit(1)
+PY
         '''
       }
       post { always { archiveArtifacts artifacts: 'reports/*.json', fingerprint: true } }
