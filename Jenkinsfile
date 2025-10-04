@@ -4,23 +4,25 @@ pipeline {
   options {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '20'))
+    // We do our own checkout stage
+    skipDefaultCheckout(true)
   }
 
   // UI toggles
   parameters {
-    booleanParam(name: 'DEPLOY_STAGING',   defaultValue: true,  description: 'Deploy to staging on every build')
-    booleanParam(name: 'DEPLOY_TO_PROD',   defaultValue: true,  description: 'Promote to prod after quality & security gates')
+    booleanParam(name: 'DEPLOY_STAGING',    defaultValue: true, description: 'Deploy to staging on every build')
+    booleanParam(name: 'DEPLOY_TO_PROD',    defaultValue: true, description: 'Promote to prod after quality & security gates')
     booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: true, description: 'Skip manual approval')
   }
 
-  // Make sure docker & sonar are found on macOS agents
+  // Ensure docker binaries are discoverable on macOS agents
   environment {
     PATH = "/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
     REGISTRY = 'ghcr.io'
     IMAGE_REPO = 'ghcr.io/akrobe/discountmate'
     DOCKER_BUILDKIT = '1'
     COMPOSE_DOCKER_CLI_BUILD = '1'
-    SONARQUBE_SERVER = 'SonarQube' // Must match Manage Jenkins > SonarQube servers
+    SONARQUBE_SERVER = 'SonarQube'
   }
 
   stages {
@@ -92,8 +94,8 @@ docker buildx build --platform linux/amd64,linux/arm64 \
     }
 
     stage('Test (unit)') {
-  steps {
-    sh '''set -eux
+      steps {
+        sh '''set -eux
 mkdir -p reports
 docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IMAGE_REPO}:${VERSION}-local sh -lc '
   pip install -r requirements.txt -r requirements-dev.txt &&
@@ -106,20 +108,20 @@ docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IM
     tests/test_unit_*.py
 '
 '''
-  }
-  post {
-    always {
-      junit(testResults: 'reports/junit.xml', allowEmptyResults: false)
-      publishHTML(target: [allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true,
-        reportDir: 'reports/htmlcov', reportFiles: 'index.html', reportName: 'Coverage (HTML)'])
-      archiveArtifacts artifacts: 'reports/coverage.xml', fingerprint: true
+      }
+      post {
+        always {
+          junit(testResults: 'reports/junit.xml', allowEmptyResults: false)
+          publishHTML(target: [allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true,
+            reportDir: 'reports/htmlcov', reportFiles: 'index.html', reportName: 'Coverage (HTML)'])
+          archiveArtifacts artifacts: 'reports/coverage.xml', fingerprint: true
+        }
+      }
     }
-  }
-}
 
     stage('Test (integration)') {
-  steps {
-    sh '''set -eux
+      steps {
+        sh '''set -eux
 docker rm -f dm_svc || true
 docker run -d --rm --name dm_svc -p 0:8080 ${IMAGE_REPO}:${VERSION}-local
 HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
@@ -136,51 +138,71 @@ docker run --rm \
 
 docker rm -f dm_svc || true
 '''
-  }
-  post {
-    always {
-      junit(testResults: 'reports/junit-it.xml', allowEmptyResults: false)
-      // keep the HTML coverage publisher from the unit stage only
+      }
+      post {
+        always {
+          junit(testResults: 'reports/junit-it.xml', allowEmptyResults: false)
+        }
+      }
     }
-  }
-}
 
-stage('Security (Bandit, pip-audit, Trivy)') {
-  steps {
-    sh '''set -eux
+    stage('Security (Bandit, pip-audit, Trivy)') {
+      steps {
+        // Bandit (non-blocking, high severity only)
+        sh '''set -eux
 mkdir -p reports
-
-# Bandit (keep enforcing high-only)
 docker run --rm -v "$PWD:/src" python:3.12-slim sh -lc '
   pip install --no-cache-dir bandit && cd /src &&
   bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high || true
 '
-
-# pip-audit (run but don't fail the job)
-docker run --rm -v "$PWD:/src" python:3.12-slim sh -lc '
-  pip install --no-cache-dir pip-audit && cd /src &&
-  pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict || true
-'
-
-# Trivy (image scan) – also non-blocking here
-docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src" aquasec/trivy:0.54.1 image \
-  --format json --output /src/reports/trivy.json \
-  --severity CRITICAL,HIGH --exit-code 1 ghcr.io/akrobe/discountmate:${VERSION}-local || true
 '''
-  }
-  post {
-    always {
-      archiveArtifacts artifacts: 'reports/*.json', fingerprint: true
+        script {
+          // pip-audit (strict)
+          int pipAuditStatus = sh(
+            script: """
+              docker run --rm -v "$PWD:/src" python:3.12-slim sh -lc '
+                pip install --no-cache-dir pip-audit && cd /src &&
+                pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
+              '
+            """,
+            returnStatus: true
+          )
+
+          // Trivy (HIGH/CRITICAL) scan the local image built above
+          int trivyStatus = sh(
+            script: """
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src" aquasec/trivy:0.54.1 image \
+                --format json --output /src/reports/trivy.json \
+                --severity CRITICAL,HIGH --exit-code 1 ${IMAGE_REPO}:${VERSION}-local
+            """,
+            returnStatus: true
+          )
+
+          // Gate logic
+          if (pipAuditStatus != 0 || trivyStatus != 0) {
+            if (params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD) {
+              input message: 'Security gate failed (pip-audit or Trivy). Proceed to production anyway?', ok: 'Proceed'
+            } else if (params.DEPLOY_TO_PROD && params.AUTO_APPROVE_PROD) {
+              error 'Security gate failed and AUTO_APPROVE_PROD is true. Failing the build.'
+            } else {
+              echo 'Security gate failed but DEPLOY_TO_PROD is disabled; continuing.'
+            }
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/*.json', fingerprint: true
+        }
+      }
     }
-  }
-}
 
     stage('Deploy: Staging (compose + gate)') {
       when { expression { return params.DEPLOY_STAGING } }
       steps {
         sh '''set -eux
 APP_PORT="$(awk -F= '/^APP_PORT=/{print $2}' env/.env.staging || echo 8081)"
-export IMAGE="ghcr.io/akrobe/discountmate:${VERSION}"
+export IMAGE="${IMAGE_REPO}:${VERSION}"
 docker compose -f docker-compose.yml --env-file env/.env.staging --profile staging up -d discountmate
 for i in $(seq 1 30); do curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1; done
 '''
@@ -202,11 +224,7 @@ for i in $(seq 1 30); do curl -sf "http://localhost:${APP_PORT}/health" && break
 echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
 docker buildx imagetools create --tag ${IMAGE_REPO}:prod ${IMAGE_REPO}:${VERSION}
 docker buildx imagetools inspect ${IMAGE_REPO}:prod
-APP_PORT=${APP_PORT:-8081}
-for i in $(seq 1 30); do
-  curl -sf "http://localhost:${APP_PORT}/health" && break
-  sleep 1
-done'''
+'''
             }
           } catch (ignored) {
             withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
@@ -214,18 +232,25 @@ done'''
 echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
 docker buildx imagetools create --tag ${IMAGE_REPO}:prod ${IMAGE_REPO}:${VERSION}
 docker buildx imagetools inspect ${IMAGE_REPO}:prod
-echo "APP_PORT=80" > env/.env.production
-export IMAGE=${IMAGE_REPO}:${VERSION}
-docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate --remove-orphans
-for i in $(seq 1 30); do curl -sf http://localhost/health && break || sleep 1; done
 '''
             }
           }
+
+          // Always deploy/verify prod after tagging
+          sh '''set -eux
+mkdir -p env
+[ -f env/.env.production ] || echo "APP_PORT=80" > env/.env.production
+APP_PORT="$(awk -F= '/^APP_PORT=/{print $2}' env/.env.production || echo 80)"
+export IMAGE="${IMAGE_REPO}:${VERSION}"
+docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate --remove-orphans
+for i in $(seq 1 30); do curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1; done
+'''
         }
       }
     }
 
     stage('Monitoring & Alerting (Prom+BB+AM)') {
+      when { expression { return params.DEPLOY_TO_PROD } }
       steps {
         sh '''set -eux
 docker compose -f docker-compose.monitoring.yml --profile monitoring up -d
