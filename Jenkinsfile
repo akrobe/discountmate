@@ -148,58 +148,59 @@ docker rm -f dm_svc || true
     }
 
     stage('Security (Bandit, pip-audit, Trivy)') {
-      steps {
-        // Bandit (non-blocking, high severity only)
-        sh '''set -eux
+  steps {
+    // Bandit (non-blocking, high severity only)
+    sh '''set -eux
 mkdir -p reports
 docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
   pip install --no-cache-dir bandit && cd /src &&
   bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high || true
 '
 '''
-        script {
-          // pip-audit (strict)
-          int pipAuditStatus = sh(
-            script: """
-              docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
-                pip install --no-cache-dir pip-audit && cd /src &&
-                pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
-              '
-            """,
-            returnStatus: true
-          )
+    script {
+      // pip-audit (strict)
+      int pipAuditStatus = sh(
+        returnStatus: true,
+        script: '''
+          docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
+            pip install --no-cache-dir pip-audit && cd /src &&
+            pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
+          '
+        '''
+      )
 
-          // Trivy (HIGH/CRITICAL) scan the local image built above
-          int trivyStatus = sh(
-            script: """
-              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$WORKSPACE:/src" aquasec/trivy:0.54.1 image \
-                --format json --output /src/reports/trivy.json \
-                --severity CRITICAL,HIGH --exit-code 1 ${IMAGE_REPO}:${VERSION}-local
-            """,
-            returnStatus: true
-          )
+      // Trivy (HIGH/CRITICAL) scan the local image built above
+      int trivyStatus = sh(
+        returnStatus: true,
+        script: """
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$WORKSPACE:/src" aquasec/trivy:0.54.1 image \
+            --format json --output /src/reports/trivy.json \
+            --severity CRITICAL,HIGH --exit-code 1 ${IMAGE_REPO}:${VERSION}-local
+        """
+      )
 
-          // Gate logic
-          if (pipAuditStatus != 0 || trivyStatus != 0) {
-            if (params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD) {
-  timeout(time: 15, unit: 'MINUTES') {
-    input message: "Security gate failed (pip-audit or Trivy). Proceed to production anyway?", ok: 'Proceed'
-  }
-}
-            } else if (params.DEPLOY_TO_PROD && params.AUTO_APPROVE_PROD) {
-              error 'Security gate failed and AUTO_APPROVE_PROD is true. Failing the build.'
-            } else {
-              echo 'Security gate failed but DEPLOY_TO_PROD is disabled; continuing.'
+      // Gate logic (with timeout around manual approval)
+      if (pipAuditStatus != 0 || trivyStatus != 0) {
+        if (params.DEPLOY_TO_PROD) {
+          if (params.AUTO_APPROVE_PROD) {
+            error('Security gate failed and AUTO_APPROVE_PROD is true. Failing the build.')
+          } else {
+            timeout(time: 15, unit: 'MINUTES') {
+              input message: 'Security gate failed (pip-audit or Trivy). Proceed to production anyway?', ok: 'Proceed'
             }
           }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/*.json', fingerprint: true
+        } else {
+          echo 'Security gate failed but DEPLOY_TO_PROD is disabled; continuing.'
         }
       }
     }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'reports/*.json', fingerprint: true
+    }
+  }
+}
 
     stage('Deploy: Staging (compose + gate)') {
       when { expression { return params.DEPLOY_STAGING } }
