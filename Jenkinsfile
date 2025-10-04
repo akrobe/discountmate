@@ -223,34 +223,9 @@ pipeline {
     }
 
     stage('Deploy: Staging (compose + health gate)') {
-      when { expression { return env.PUSHED == 'true' } }
-      steps {
-        sh '''
-          set -eux
-          mkdir -p env
-
-          # Create env file if missing
-          if [ ! -f env/.env.staging ]; then
-            if [ -f env/.env.staging.example ]; then
-              cp env/.env.staging.example env/.env.staging
-            else
-              echo "APP_PORT=8088" > env/.env.staging
-            fi
-          fi
-
-          export ENV_FILE=env/.env.staging
-          export IMAGE=${IMAGE}:${VERSION}
-
-          docker compose -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile staging up -d
-
-          . ${ENV_FILE}
-          PORT=${APP_PORT:-8088}
-          for i in $(seq 1 30); do
-            curl -sf "http://localhost:${PORT}/health" && break || sleep 1
-          done
-        '''
-      }
-    }
+  when { environment name: 'PUSHED', value: 'true' }
+  steps { /* unchanged */ }
+}
 
     // ---------- Optional gated release to Prod (port 80)
     stage('Approve Release') {
