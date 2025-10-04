@@ -160,7 +160,7 @@ docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
           // pip-audit (strict)
           int pipAuditStatus = sh(
             script: """
-              docker run --rm -v "${env.WORKSPACE}:/src" python:3.12-slim sh -lc '
+              docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
                 pip install --no-cache-dir pip-audit && cd /src &&
                 pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
               '
@@ -171,7 +171,7 @@ docker run --rm -v "$WORKSPACE:/src" python:3.12-slim sh -lc '
           // Trivy (HIGH/CRITICAL) scan the local image built above
           int trivyStatus = sh(
             script: """
-              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${env.WORKSPACE}:/src" aquasec/trivy:0.54.1 image \
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$WORKSPACE:/src" aquasec/trivy:0.54.1 image \
                 --format json --output /src/reports/trivy.json \
                 --severity CRITICAL,HIGH --exit-code 1 ${IMAGE_REPO}:${VERSION}-local
             """,
