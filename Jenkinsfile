@@ -9,11 +9,13 @@ pipeline {
     booleanParam(name: 'DO_SONAR', defaultValue: false, description: 'Enable SonarQube analysis + Quality Gate')
   }
 
-  environment {
-    APP_NAME = 'discountmate'
-    REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"   // change if needed
-    IMAGE_BASENAME = "${REGISTRY}/${APP_NAME}"
-  }
+environment {
+  APP_NAME = 'discountmate'
+  REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"
+  IMAGE_BASENAME = "${REGISTRY}/${APP_NAME}"
+  // Add Docker CLI locations for macOS (Intel + Apple Silicon) + standard paths
+  PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+}
 
   stages {
     stage('Checkout') {
@@ -31,6 +33,25 @@ pipeline {
         echo "VERSION=${env.VERSION}"
       }
     }
+
+
+stage('Docker Sanity') {
+  steps {
+    sh '''
+      set -eux
+      which docker || true
+      docker --version
+      # v2 integrated compose; fallback to standalone if not present
+      if docker compose version >/dev/null 2>&1; then
+        echo "Using docker compose (v2)"
+      elif command -v docker-compose >/dev/null 2>&1; then
+        echo "Using docker-compose (v1)"; alias docker='docker'; alias "docker compose"="docker-compose"
+      else
+        echo "No docker compose found"; exit 1
+      fi
+    '''
+  }
+}
 
     stage('Build (Docker → GHCR)') {
       steps {
