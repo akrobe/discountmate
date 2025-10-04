@@ -8,8 +8,8 @@ pipeline {
   }
 
   parameters {
-     booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to staging after a successful push')
-    booleanParam(name: 'DEPLOY_TO_PROD',    defaultValue: false, description: 'Enable the Prod release stage for this run')
+    booleanParam(name: 'DEPLOY_STAGING',  defaultValue: true,  description: 'Deploy to staging after a successful push')
+    booleanParam(name: 'DEPLOY_TO_PROD',  defaultValue: false, description: 'Enable the Prod release stage for this run')
     booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: false, description: 'Skip manual approval (no pause) when releasing to Prod')
     string(name: 'ROLLBACK_TO_VERSION', defaultValue: '', description: 'Optional: version to rollback to (e.g. 2025.10.04-26-39308f7)')
   }
@@ -26,9 +26,6 @@ pipeline {
     // Compose files
     COMPOSE_FILE       = 'compose.yaml'        // minimal staging compose (8088)
     COMPOSE_FILE_PROD  = 'docker-compose.yml'  // full compose (we deploy only the app service)
-
-    // default so `when { expression { env.PUSHED == "true" } }` is safe
-    PUSHED = 'false'
   }
 
   stages {
@@ -48,6 +45,7 @@ pipeline {
         '''
         script {
           env.VERSION = sh(script: "awk -F= '/^VERSION=/{print \$2}' reports/version.txt", returnStdout: true).trim()
+          env.PUSHED  = 'false' // initialize here (not in environment {})
         }
       }
     }
@@ -224,47 +222,59 @@ pipeline {
     }
 
     stage('Deploy: Staging (compose + health gate)') {
-  when {
-    beforeAgent true
-    allOf {
-      expression { env.PUSHED?.trim() == 'true' }   // image was pushed
-      expression { params.DEPLOY_STAGING }          // user wants staging
+      when {
+        beforeAgent true
+        allOf {
+          expression { env.PUSHED?.trim() == 'true' }   // image was pushed
+          expression { params.DEPLOY_STAGING }          // user wants staging
+        }
+      }
+      steps {
+        sh """
+          set -eux
+          mkdir -p env
+          [ -f env/.env.staging ] || echo "APP_PORT=8088" > env/.env.staging
+
+          export ENV_FILE=env/.env.staging
+          export IMAGE=${IMAGE}:${VERSION}
+
+          docker compose -f ${COMPOSE_FILE} --env-file "$ENV_FILE" up -d
+
+          # Health gate on 8088
+          for i in \$(seq 1 30); do
+            curl -sf http://localhost:8088/health && break || sleep 1
+          done
+        """
+      }
     }
-  }
-  steps {
-    // 👇 replace your /* unchanged */ with something like this:
-    sh """
-      set -eux
-      mkdir -p env
-      [ -f env/.env.staging ] || echo "APP_PORT=8088" > env/.env.staging
 
-      export ENV_FILE=env/.env.staging
-      export IMAGE=${IMAGE}:${VERSION}
-
-      docker compose -f ${COMPOSE_FILE} --env-file "$ENV_FILE" up -d
-
-      # Health gate on 8088
-      for i in \$(seq 1 30); do
-        curl -sf http://localhost:8088/health && break || sleep 1
-      done
-    """
-  }
-}
-
-stage('Gate Debug') {
-  steps {
-    echo "PUSHED=${env.PUSHED} DEPLOY_TO_PROD=${params.DEPLOY_TO_PROD} AUTO_APPROVE_PROD=${params.AUTO_APPROVE_PROD}"
-  }
-}
-
-stage('Release: Prod') {
-  when {
-    beforeAgent true
-    allOf {
-      expression { env.PUSHED?.trim() == 'true' }
-      expression { params.DEPLOY_TO_PROD }   // <-- fix here
+    // ---------- Optional gated release to Prod (port 80)
+    stage('Approve Release') {
+      when {
+        expression { params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD }
+      }
+      steps {
+        timeout(time: 2, unit: 'HOURS') {
+          input message: "Deploy ${env.VERSION} to PRODUCTION (port 80)?", ok: 'Release'
+        }
+      }
     }
-  }
+
+    stage('Gate Debug') {
+      steps {
+        echo "PUSHED=${env.PUSHED} DEPLOY_STAGING=${params.DEPLOY_STAGING} " +
+             "DEPLOY_TO_PROD=${params.DEPLOY_TO_PROD} AUTO_APPROVE_PROD=${params.AUTO_APPROVE_PROD}"
+      }
+    }
+
+    stage('Release: Prod') {
+      when {
+        beforeAgent true
+        allOf {
+          expression { env.PUSHED?.trim() == 'true' }
+          expression { params.DEPLOY_TO_PROD }
+        }
+      }
       steps {
         script {
           // Ensure we’re logged in to GHCR
@@ -317,7 +327,7 @@ stage('Release: Prod') {
           input message: "Rollback PRODUCTION to ${params.ROLLBACK_TO_VERSION}?", ok: 'Rollback'
         }
         script {
-          // Login (same logic, keeps things self-contained)
+          // Login (same logic)
           def loggedIn = false
           try {
             withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
