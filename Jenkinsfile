@@ -1,6 +1,11 @@
 pipeline {
   agent any
-  options { timestamps(); ansiColor('xterm'); buildDiscarder(logRotator(numToKeepStr: '20')) }
+
+  options {
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
   parameters {
     booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to staging on every build')
     booleanParam(name: 'DEPLOY_TO_PROD', defaultValue: true, description: 'Promote to prod after quality & security gates')
@@ -17,7 +22,6 @@ pipeline {
   }
 
   stages {
-
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -53,7 +57,6 @@ docker buildx inspect --bootstrap
     stage('Build') {
       steps {
         script {
-          // Try ghcr_pat first; fall back to github-https (works per your earlier build)
           try {
             withCredentials([usernamePassword(credentialsId: 'ghcr_pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
               sh '''set -eux
