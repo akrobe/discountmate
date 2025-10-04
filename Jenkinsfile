@@ -6,22 +6,25 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
+  // UI toggles
   parameters {
-    booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to staging on every build')
-    booleanParam(name: 'DEPLOY_TO_PROD', defaultValue: true, description: 'Promote to prod after quality & security gates')
+    booleanParam(name: 'DEPLOY_STAGING',   defaultValue: true,  description: 'Deploy to staging on every build')
+    booleanParam(name: 'DEPLOY_TO_PROD',   defaultValue: true,  description: 'Promote to prod after quality & security gates')
     booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: true, description: 'Skip manual approval')
   }
 
-  // SonarQube server name MUST match Manage Jenkins > SonarQube servers
+  // Make sure docker & sonar are found on macOS agents
   environment {
+    PATH = "/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
     REGISTRY = 'ghcr.io'
     IMAGE_REPO = 'ghcr.io/akrobe/discountmate'
     DOCKER_BUILDKIT = '1'
     COMPOSE_DOCKER_CLI_BUILD = '1'
-    SONARQUBE_SERVER = 'SonarQube'
+    SONARQUBE_SERVER = 'SonarQube' // Must match Manage Jenkins > SonarQube servers
   }
 
   stages {
+
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -46,7 +49,10 @@ echo "VERSION=$VERSION" | tee reports/version.txt
     stage('Docker Sanity') {
       steps {
         sh '''set -eux
+echo "PATH=$PATH"
+command -v docker
 docker version
+docker compose version
 docker buildx version
 docker buildx inspect ci-builder || docker buildx create --use --name ci-builder
 docker buildx inspect --bootstrap
@@ -69,6 +75,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 '''
             }
           } catch (ignored) {
+            // Fallback to the github-https creds if PAT id isn't present
             withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
               sh '''set -eux
 echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
@@ -127,18 +134,28 @@ docker rm -f dm_svc || true
       }
     }
 
+    // SonarQube via Docker (no local scanner needed) + Quality Gate wait
     stage('Code Quality (SonarQube)') {
       steps {
         withSonarQubeEnv("${SONARQUBE_SERVER}") {
           withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
             sh '''set -eux
-sonar-scanner \
-  -Dsonar.login="${SONAR_TOKEN}" \
+docker run --rm \
+  -e SONAR_HOST_URL="${SONAR_HOST_URL}" \
+  -e SONAR_LOGIN="${SONAR_TOKEN}" \
+  -v "$PWD:/usr/src" \
+  sonarsource/sonar-scanner-cli \
   -Dsonar.projectKey=discountmate \
-  -Dsonar.projectBaseDir=. \
-  -Dsonar.qualitygate.wait=true
+  -Dsonar.projectBaseDir=/usr/src \
+  -Dsonar.sources=app \
+  -Dsonar.tests=tests \
+  -Dsonar.python.coverage.reportPaths=/usr/src/reports/coverage.xml \
+  -Dsonar.sourceEncoding=UTF-8
 '''
           }
+        }
+        timeout(time: 10, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
         }
       }
     }
@@ -147,11 +164,14 @@ sonar-scanner \
       steps {
         sh '''set -eux
 mkdir -p reports
+# Static code checks (fail build only on high severity findings)
 docker run --rm -v "$PWD:/src" python:3.12-slim sh -lc "
   pip install --no-cache-dir bandit pip-audit && cd /src &&
-  bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high || true &&
+  bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high &&
   pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
 "
+
+# Container image vuln scan (fail on HIGH/CRITICAL)
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD/reports:/reports" \
@@ -223,6 +243,7 @@ docker compose -f docker-compose.monitoring.yml --profile monitoring up -d
 for i in $(seq 1 30); do curl -sf http://localhost:9090/-/ready && break || sleep 1; done
 for i in $(seq 1 30); do curl -sf http://localhost:9093/api/v2/status && break || sleep 1; done
 curl -sf "http://localhost:9090/api/v1/targets" | grep -q '"health":"up"'
+# Simulate outage -> alert
 docker compose -f docker-compose.yml --env-file env/.env.production --profile prod stop discountmate || true
 sleep 40
 curl -sf "http://localhost:9093/api/v2/alerts" | grep -q 'AppDown' || (echo "Alert did not fire" && exit 1)
