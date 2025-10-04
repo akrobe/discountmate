@@ -202,11 +202,11 @@ for i in $(seq 1 30); do curl -sf http://localhost:8080/health && break || sleep
 echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
 docker buildx imagetools create --tag ${IMAGE_REPO}:prod ${IMAGE_REPO}:${VERSION}
 docker buildx imagetools inspect ${IMAGE_REPO}:prod
-echo "APP_PORT=80" > env/.env.production
-export IMAGE=${IMAGE_REPO}:${VERSION}
-docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate --remove-orphans
-for i in $(seq 1 30); do curl -sf http://localhost/health && break || sleep 1; done
-'''
+APP_PORT=${APP_PORT:-8081}
+for i in $(seq 1 30); do
+  curl -sf "http://localhost:${APP_PORT}/health" && break
+  sleep 1
+done'''
             }
           } catch (ignored) {
             withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
