@@ -238,10 +238,10 @@ pipeline {
           export ENV_FILE=env/.env.staging
           export IMAGE=${IMAGE}:${VERSION}
 
-          docker compose -f ${COMPOSE_FILE} --env-file "$ENV_FILE" up -d
+          docker compose -f ${COMPOSE_FILE} --env-file "\\$ENV_FILE" up -d
 
           # Health gate on 8088
-          for i in \$(seq 1 30); do
+          for i in \\(seq 1 30); do
             curl -sf http://localhost:8088/health && break || sleep 1
           done
         """
@@ -306,10 +306,10 @@ pipeline {
             export ENV_FILE=env/.env.production
             export IMAGE=${IMAGE}:${VERSION}
 
-            docker compose -f ${COMPOSE_FILE_PROD} --env-file "$ENV_FILE" --profile prod up -d discountmate
+            docker compose -f ${COMPOSE_FILE_PROD} --env-file "\\$ENV_FILE" --profile prod up -d discountmate
 
             # Smoke test port 80
-            for i in \$(seq 1 30); do
+            for i in \\(seq 1 30); do
               curl -sf http://localhost/health && break || sleep 1
             done
           """
@@ -353,10 +353,10 @@ pipeline {
             docker pull ${IMAGE}
 
             # Redeploy only the app service
-            docker compose -f ${COMPOSE_FILE_PROD} --env-file "$ENV_FILE" --profile prod up -d discountmate
+            docker compose -f ${COMPOSE_FILE_PROD} --env-file "\\$ENV_FILE" --profile prod up -d discountmate
 
             # Smoke test port 80
-            for i in \$(seq 1 30); do
+            for i in \\(seq 1 30); do
               curl -sf http://localhost/health && break || sleep 1
             done
           """
