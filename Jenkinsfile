@@ -143,28 +143,40 @@ pipeline {
     }
 
     stage('Test (integration)') {
-      steps {
-        sh '''
-          set -eux
-          docker rm -f dm_svc || true
-          docker run -d --rm --name dm_svc -p 8088:8080 ${IMAGE}:${VERSION}-local
+  steps {
+    sh '''
+      set -eux
 
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8088/health && break || sleep 1
-          done
+      # Make sure no old tester containers are around (any port)
+      docker rm -f dm_svc || true
 
-          docker run --rm \
-            -v "$PWD":/workspace -w /workspace \
-            -e PYTHONPATH=/workspace \
-            -e BASE_URL=http://host.docker.internal:8088 \
-            ${IMAGE}:${VERSION}-local \
-            sh -lc 'pip install -r requirements.txt -r requirements-dev.txt && \
-                    pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py'
+      # Start test container on a RANDOM free host port
+      docker run -d --rm --name dm_svc -p 0:8080 ghcr.io/akrobe/discountmate:${VERSION}-local
 
-          docker rm -f dm_svc || true
-        '''
-      }
-    }
+      # Discover the port that Docker assigned on the host
+      HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
+      echo "Using HOST_PORT=$HOST_PORT"
+
+      # Wait for health
+      for i in $(seq 1 30); do
+        curl -fsS "http://localhost:${HOST_PORT}/health" && break || sleep 1
+      done
+
+      # Run integration tests against that dynamic port
+      docker run --rm \
+        -v "$WORKSPACE":/workspace -w /workspace \
+        -e PYTHONPATH=/workspace \
+        -e BASE_URL="http://host.docker.internal:${HOST_PORT}" \
+        ghcr.io/akrobe/discountmate:${VERSION}-local sh -lc '
+          pip install -r requirements.txt -r requirements-dev.txt &&
+          pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
+        '
+
+      # Stop container (it has --rm so it will be removed)
+      docker rm -f dm_svc || true
+    '''
+  }
+}
 
     stage('Security (Bandit, pip-audit, Trivy)') {
       steps {
