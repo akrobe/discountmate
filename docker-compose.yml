@@ -26,5 +26,9 @@ services:
     restart: unless-stopped
 
   discountmate:
+    image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}  # fallback so CLI runs don’t fail
+    container_name: discountmate
     ports:
-      - "${APP_PORT:-8081}:8080"
+      - "${APP_PORT:-8081}:8080"   # host:container — move host to 8081
+    profiles:
+      - staging
