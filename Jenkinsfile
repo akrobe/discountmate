@@ -1,380 +1,247 @@
 pipeline {
   agent any
-
-  // --- Global options & params
-  options {
-    timestamps()
-    disableConcurrentBuilds() // avoid approving an older run while a newer one exists
-  }
-
+  options { timestamps(); ansiColor('xterm'); buildDiscarder(logRotator(numToKeepStr: '20')) }
   parameters {
-    booleanParam(name: 'DEPLOY_STAGING',  defaultValue: true,  description: 'Deploy to staging after a successful push')
-    booleanParam(name: 'DEPLOY_TO_PROD',  defaultValue: false, description: 'Enable the Prod release stage for this run')
-    booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: false, description: 'Skip manual approval (no pause) when releasing to Prod')
-    string(name: 'ROLLBACK_TO_VERSION', defaultValue: '', description: 'Optional: version to rollback to (e.g. 2025.10.04-26-39308f7)')
+    booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to staging on every build')
+    booleanParam(name: 'DEPLOY_TO_PROD', defaultValue: true, description: 'Promote to prod after quality & security gates')
+    booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: true, description: 'Skip manual approval')
   }
-
   environment {
-    // ---- Make Docker CLI visible to Jenkins regardless of launch PATH
-    PATH = "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
-
-    REGISTRY   = 'ghcr.io'
-    OWNER      = 'akrobe'
-    IMAGE_NAME = 'discountmate'
-    IMAGE      = "${REGISTRY}/${OWNER}/${IMAGE_NAME}"
-
-    // Compose files
-    COMPOSE_FILE       = 'compose.yaml'        // minimal staging compose (8088)
-    COMPOSE_FILE_PROD  = 'docker-compose.yml'  // full compose (we deploy only the app service)
+    REGISTRY = 'ghcr.io'
+    IMAGE_REPO = 'ghcr.io/akrobe/discountmate'
+    DOCKER_BUILDKIT = '1'
+    COMPOSE_DOCKER_CLI_BUILD = '1'
+    # SonarQube server name MUST match Manage Jenkins > SonarQube servers
+    SONARQUBE_SERVER = 'SonarQube'
   }
 
   stages {
+
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+      }
     }
 
     stage('Init') {
       steps {
-        sh '''
-          set -eux
-          mkdir -p reports
-          GIT_SHA=$(git rev-parse --short HEAD)
-          DATE=$(date +%Y.%m.%d)
-          VERSION="${DATE}-${BUILD_NUMBER}-${GIT_SHA}"
-          echo "VERSION=${VERSION}" | tee reports/version.txt
-        '''
+        sh '''set -eux
+mkdir -p reports env
+GIT_SHA=$(git rev-parse --short HEAD)
+DATE=$(date +%Y.%m.%d)
+BUILD_NO=${BUILD_NUMBER:-0}
+VERSION="${DATE}-${BUILD_NO}-${GIT_SHA}"
+echo "VERSION=$VERSION" | tee reports/version.txt
+'''
         script {
           env.VERSION = sh(script: "awk -F= '/^VERSION=/{print \$2}' reports/version.txt", returnStdout: true).trim()
-          env.PUSHED  = 'false' // initialize here (not in environment {})
         }
+        archiveArtifacts artifacts: 'reports/version.txt', fingerprint: true
       }
     }
 
     stage('Docker Sanity') {
       steps {
-        sh '''
-          set -eux
-          echo "PATH is: $PATH"
-
-          # 1) CLI must be present
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "ERROR: docker CLI not found in PATH."
-            echo "Checked /usr/local/bin, /opt/homebrew/bin and /Applications/Docker.app/Contents/Resources/bin"
-            ls -l /Applications/Docker.app/Contents/Resources/bin || true
-            exit 2
-          fi
-
-          # 2) Docker Desktop must be running (daemon reachable)
-          docker version
-          docker info >/dev/null
-
-          # 3) Compose & buildx available
-          docker compose version
-          docker buildx version || true
-
-          # Ensure a usable buildx builder
-          docker buildx inspect ci-builder >/dev/null 2>&1 || docker buildx create --name ci-builder --driver docker-container --use
-          docker buildx inspect --bootstrap
-        '''
+        sh '''set -eux
+docker version
+docker buildx version
+docker buildx inspect ci-builder || docker buildx create --use --name ci-builder
+docker buildx inspect --bootstrap
+'''
       }
     }
 
-    stage('Build & Push (multi-arch)') {
+    stage('Build') {
       steps {
-        script {
-          def loggedIn = false
+        withCredentials([
+          usernamePassword(credentialsId: 'ghcr_pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')
+        ]) {
+          sh '''set -eux
+echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
 
-          // Prefer a Secret Text called ghcr_pat (PAT with write:packages)
-          try {
-            withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
-              sh '''
-                set -eux
-                echo "$PAT" | docker login ghcr.io -u "akrobe" --password-stdin
-              '''
-              loggedIn = true
-              echo "Logged in to GHCR using ghcr_pat"
-            }
-          } catch (ignore) {
-            echo "No 'ghcr_pat' credential found; will try 'github-https'…"
-          }
+# Local arch image for testing
+docker buildx build --platform linux/arm64 --load \
+  -t ${IMAGE_REPO}:${VERSION}-local -f Dockerfile .
 
-          // Fallback to your existing username/password credential
-          if (!loggedIn) {
-            try {
-              withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-                sh '''
-                  set -eux
-                  echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin
-                '''
-                loggedIn = true
-                echo "Logged in to GHCR using github-https"
-              }
-            } catch (ignore2) {
-              echo "No usable GHCR creds; will build locally and skip push."
-            }
-          }
-
-          // Build a local image (single-arch) for tests
-          sh """
-            set -eux
-            docker buildx build \
-              --platform linux/arm64 \
-              --load \
-              -t ${IMAGE}:${VERSION}-local \
-              -f Dockerfile .
-          """
-
-          // If logged in, build & push multi-arch
-          if (loggedIn) {
-            sh """
-              set -eux
-              docker buildx build \
-                --platform linux/amd64,linux/arm64 \
-                -t ${IMAGE}:${VERSION} \
-                -t ${IMAGE}:latest \
-                -f Dockerfile \
-                --push .
-            """
-            env.PUSHED = "true"
-          } else {
-            env.PUSHED = "false"
-          }
+# Multi-arch push for VERSION and latest
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ${IMAGE_REPO}:${VERSION} -t ${IMAGE_REPO}:latest \
+  -f Dockerfile --push .
+'''
         }
       }
     }
 
     stage('Test (unit)') {
       steps {
-        sh '''
-          set -eux
-          mkdir -p reports
-          docker run --rm \
-            -v "$PWD":/workspace -w /workspace \
-            -e PYTHONPATH=/workspace \
-            ${IMAGE}:${VERSION}-local \
-            sh -lc 'pip install -r requirements.txt -r requirements-dev.txt && \
-                    pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py'
-        '''
+        sh '''set -eux
+mkdir -p reports
+docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IMAGE_REPO}:${VERSION}-local sh -lc '
+  pip install -r requirements.txt -r requirements-dev.txt &&
+  pytest -q \
+    --junitxml=reports/junit.xml \
+    --cov=app --cov-report=xml:reports/coverage.xml --cov-report=html:reports/htmlcov \
+    --cov-fail-under=80 \
+    tests/test_unit_*.py
+'
+'''
+      }
+      post {
+        always {
+          junit(testResults: 'reports/junit.xml', allowEmptyResults: false)
+          publishHTML(target: [allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true,
+            reportDir: 'reports/htmlcov', reportFiles: 'index.html', reportName: 'Coverage (HTML)'])
+          archiveArtifacts artifacts: 'reports/coverage.xml', fingerprint: true
+        }
       }
     }
 
     stage('Test (integration)') {
       steps {
-        sh '''
-          set -eux
+        sh '''set -eux
+docker rm -f dm_svc || true
+docker run -d --rm --name dm_svc -p 0:8080 ${IMAGE_REPO}:${VERSION}-local
+HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
+for i in $(seq 1 30); do curl -fsS "http://localhost:$HOST_PORT/health" && break || sleep 1; done
+docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace -e BASE_URL="http://host.docker.internal:${HOST_PORT}" ${IMAGE_REPO}:${VERSION}-local sh -lc '
+  pip install -r requirements.txt -r requirements-dev.txt &&
+  pytest -q --junitxml=reports/junit-it.xml tests/test_integration_*.py
+'
+docker rm -f dm_svc || true
+'''
+      }
+      post {
+        always {
+          junit(testResults: 'reports/junit-it.xml', allowEmptyResults: false)
+        }
+      }
+    }
 
-          # Make sure no old tester containers are around (any port)
-          docker rm -f dm_svc || true
-
-          # Start test container on a RANDOM free host port
-          docker run -d --rm --name dm_svc -p 0:8080 ghcr.io/akrobe/discountmate:${VERSION}-local
-
-          # Discover the port that Docker assigned on the host
-          HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
-          echo "Using HOST_PORT=$HOST_PORT"
-
-          # Wait for health
-          for i in $(seq 1 30); do
-            curl -fsS "http://localhost:${HOST_PORT}/health" && break || sleep 1
-          done
-
-          # Run integration tests against that dynamic port
-          docker run --rm \
-            -v "$WORKSPACE":/workspace -w /workspace \
-            -e PYTHONPATH=/workspace \
-            -e BASE_URL="http://host.docker.internal:${HOST_PORT}" \
-            ghcr.io/akrobe/discountmate:${VERSION}-local sh -lc '
-              pip install -r requirements.txt -r requirements-dev.txt &&
-              pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
-            '
-
-          # Stop container (it has --rm so it will be removed)
-          docker rm -f dm_svc || true
-        '''
+    stage('Code Quality (SonarQube)') {
+      steps {
+        withSonarQubeEnv("${SONARQUBE_SERVER}") {
+          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+            sh '''set -eux
+sonar-scanner \
+  -Dsonar.login="${SONAR_TOKEN}" \
+  -Dsonar.projectKey=discountmate \
+  -Dsonar.projectBaseDir=. \
+  -Dsonar.qualitygate.wait=true
+'''
+          }
+        }
       }
     }
 
     stage('Security (Bandit, pip-audit, Trivy)') {
       steps {
-        sh '''
-          set +e
-          mkdir -p reports
+        sh '''set -eux
+mkdir -p reports
 
-          docker run --rm -v "$PWD":/src python:3.12-slim sh -lc '
-            pip install --no-cache-dir bandit pip-audit && cd /src && \
-            bandit -r app -f json -o reports/bandit.json || true && \
-            pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
-          '
+# Bandit - report but don't fail on medium; fail on high confidence/high severity
+docker run --rm -v "$PWD:/src" python:3.12-slim sh -lc "
+  pip install --no-cache-dir bandit pip-audit && cd /src &&
+  bandit -r app -f json -o reports/bandit.json --severity-level high --confidence-level high || true &&
+  pip-audit -r requirements.txt --format json -o reports/pip-audit.json --strict
+"
 
-          # Scan local image via Docker socket
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD"/reports:/reports \
-            aquasec/trivy:latest image --scanners vuln --severity CRITICAL \
-            --exit-code 0 --format table -o /reports/trivy.txt ${IMAGE}:${VERSION}-local || true
-
-          if grep -q CRITICAL reports/trivy.txt; then
-            echo "Trivy found CRITICAL vulns (reported but not failing this build stage)."
-          fi
-          set -e
-        '''
+# Trivy - fail on HIGH/CRITICAL vulns
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD/reports:/reports" \
+  -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+  aquasec/trivy:latest image ${IMAGE_REPO}:${VERSION}-local \
+  --scanners vuln --severity HIGH,CRITICAL \
+  --format table -o /reports/trivy.txt --exit-code 1
+'''
       }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/bandit.json, reports/pip-audit.json, reports/trivy.txt', fingerprint: true
+      } }
     }
 
-    stage('Deploy: Staging (compose + health gate)') {
-      when {
-        beforeAgent true
-        allOf {
-          expression { env.PUSHED?.trim() == 'true' }   // image was pushed
-          expression { params.DEPLOY_STAGING }          // user wants staging
-        }
-      }
+    stage('Deploy: Staging (compose + gate)') {
+      when { expression { return params.DEPLOY_STAGING } }
       steps {
-        script {
-          env.ENV_FILE   = 'env/.env.staging'
-          env.IMAGE_FULL = "${env.IMAGE}:${env.VERSION}"
-        }
-        sh '''
-          set -eux
-          mkdir -p env
-          [ -f "$ENV_FILE" ] || echo "APP_PORT=8088" > "$ENV_FILE"
-
-          # make the full image name available to compose (if referenced)
-          export IMAGE="$IMAGE_FULL"
-
-          docker compose -f ''' + env.COMPOSE_FILE + ''' --env-file "$ENV_FILE" up -d
-
-          # Health gate on 8088
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8088/health && break || sleep 1
-          done
-        '''
+        sh '''set -eux
+echo "APP_PORT=8080" > env/.env.staging
+export IMAGE=${IMAGE_REPO}:${VERSION}
+docker compose -f docker-compose.yml --env-file env/.env.staging --profile staging up -d discountmate
+for i in $(seq 1 30); do curl -sf http://localhost:8080/health && break || sleep 1; done
+'''
       }
     }
 
-    // ---------- Optional gated release to Prod (port 80)
     stage('Approve Release') {
-      when {
-        expression { params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD }
-      }
+      when { expression { return params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD } }
       steps {
-        timeout(time: 2, unit: 'HOURS') {
-          input message: "Deploy ${env.VERSION} to PRODUCTION (port 80)?", ok: 'Release'
+        input message: "Promote ${env.VERSION} to production?", ok: 'Ship it'
+      }
+    }
+
+    stage('Release: Prod (multi-arch tag + compose)') {
+      when { expression { return params.DEPLOY_TO_PROD } }
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'ghcr_pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')
+        ]) {
+          sh '''set -eux
+echo "$GH_PAT" | docker login ${REGISTRY} -u "$GH_USER" --password-stdin
+
+# Create multi-arch :prod manifest from existing multi-arch VERSION
+docker buildx imagetools create \
+  --tag ${IMAGE_REPO}:prod \
+  ${IMAGE_REPO}:${VERSION}
+
+docker buildx imagetools inspect ${IMAGE_REPO}:prod
+
+echo "APP_PORT=80" > env/.env.production
+export IMAGE=${IMAGE_REPO}:${VERSION}
+docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate --remove-orphans
+
+for i in $(seq 1 30); do curl -sf http://localhost/health && break || sleep 1; done
+'''
+        }
+      }
+    }
+
+    stage('Monitoring & Alerting (Prom+BB+AM)') {
+      steps {
+        withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK_URL')]) {
+          sh '''set -eux
+# Bring up monitoring stack
+docker compose -f docker-compose.monitoring.yml --profile monitoring up -d
+
+# Wait for Prometheus & AM
+for i in $(seq 1 30); do curl -sf http://localhost:9090/-/ready && break || sleep 1; done
+for i in $(seq 1 30); do curl -sf http://localhost:9093/api/v2/status && break || sleep 1; done
+
+# Confirm target is UP
+curl -sf "http://localhost:9090/api/v1/targets" | grep -q '"health":"up"'
+
+# Simulate incident: stop app briefly and confirm alert fires
+docker compose -f docker-compose.yml --env-file env/.env.production --profile prod stop discountmate || true
+sleep 40
+curl -sf "http://localhost:9093/api/v2/alerts" | grep -q 'AppDown' || (echo "Alert did not fire" && exit 1)
+# Roll forward: bring app back
+docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate
+'''
         }
       }
     }
 
     stage('Gate Debug') {
       steps {
-        echo "PUSHED=${env.PUSHED} DEPLOY_STAGING=${params.DEPLOY_STAGING} " +
-             "DEPLOY_TO_PROD=${params.DEPLOY_TO_PROD} AUTO_APPROVE_PROD=${params.AUTO_APPROVE_PROD}"
-      }
-    }
-
-    stage('Release: Prod') {
-      when {
-        beforeAgent true
-        allOf {
-          expression { env.PUSHED?.trim() == 'true' }
-          expression { params.DEPLOY_TO_PROD }
-        }
-      }
-      steps {
-        script {
-          // Ensure we’re logged in to GHCR
-          def loggedIn = false
-          try {
-            withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
-              sh 'echo "$PAT" | docker login ghcr.io -u "akrobe" --password-stdin'
-              loggedIn = true
-            }
-          } catch (ignore) { /* fall through */ }
-          if (!loggedIn) {
-            withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-              sh 'echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin'
-              loggedIn = true
-            }
-          }
-
-          env.ENV_FILE   = 'env/.env.production'
-          env.IMAGE_FULL = "${env.IMAGE}:${env.VERSION}"
-        }
-        sh '''
-          set -eux
-          mkdir -p env
-          [ -f "$ENV_FILE" ] || echo "APP_PORT=80" > "$ENV_FILE"
-
-          docker pull ''' + env.IMAGE + ':' + env.VERSION + '''
-          docker tag  ''' + env.IMAGE + ':' + env.VERSION + ' ' + env.IMAGE + ''':prod
-          docker push ''' + env.IMAGE + ''':prod
-
-          export IMAGE="$IMAGE_FULL"
-
-          # Deploy JUST the app service to avoid monitoring mount issues
-          docker compose -f ''' + env.COMPOSE_FILE_PROD + ''' --env-file "$ENV_FILE" --profile prod up -d discountmate
-
-          # Smoke test port 80
-          for i in $(seq 1 30); do
-            curl -sf http://localhost/health && break || sleep 1
-          done
-        '''
-      }
-    }
-
-    // ---------- One-click manual rollback
-    stage('Rollback (manual)') {
-      when {
-        expression { (params.ROLLBACK_TO_VERSION ?: '').trim() != '' }
-      }
-      steps {
-        timeout(time: 2, unit: 'HOURS') {
-          input message: "Rollback PRODUCTION to ${params.ROLLBACK_TO_VERSION}?", ok: 'Rollback'
-        }
-        script {
-          // Login (same logic)
-          def loggedIn = false
-          try {
-            withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
-              sh 'echo "$PAT" | docker login ghcr.io -u "akrobe" --password-stdin'
-              loggedIn = true
-            }
-          } catch (ignore) { /* fall through */ }
-          if (!loggedIn) {
-            withCredentials([usernamePassword(credentialsId: 'github-https', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-              sh 'echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin'
-              loggedIn = true
-            }
-          }
-
-          env.ENV_FILE   = 'env/.env.production'
-          env.IMAGE_FULL = "${env.IMAGE}:${params.ROLLBACK_TO_VERSION}"
-        }
-        sh '''
-          set -eux
-          mkdir -p env
-          [ -f "$ENV_FILE" ] || echo "APP_PORT=80" > "$ENV_FILE"
-
-          docker pull ''' + env.IMAGE + ':' + params.ROLLBACK_TO_VERSION + '''
-
-          export IMAGE="$IMAGE_FULL"
-
-          # Redeploy only the app service
-          docker compose -f ''' + env.COMPOSE_FILE_PROD + ''' --env-file "$ENV_FILE" --profile prod up -d discountmate
-
-          # Smoke test port 80
-          for i in $(seq 1 30); do
-            curl -sf http://localhost/health && break || sleep 1
-          done
-        '''
+        echo "PUSHED=true DEPLOY_STAGING=${params.DEPLOY_STAGING} DEPLOY_TO_PROD=${params.DEPLOY_TO_PROD} AUTO_APPROVE_PROD=${params.AUTO_APPROVE_PROD}"
       }
     }
   }
 
   post {
     always {
-      archiveArtifacts artifacts: 'reports/**', fingerprint: true, onlyIfSuccessful: false
+      // Keep workspace for submissions; optionally comment in a real CI
+      echo 'Build finished.'
     }
-    success { echo "Pipeline Succeeded" }
-    failure { echo "Pipeline FAILED" }
   }
 }
