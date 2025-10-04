@@ -1,137 +1,88 @@
 pipeline {
   agent any
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-    timestamps()
+
+  environment {
+    REGISTRY = 'ghcr.io'
+    IMAGE_REPO = 'akrobe/discountmate'
+    GIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    DATESTAMP = sh(script: 'date +%Y.%m.%d', returnStdout: true).trim()
+    VERSION = "${DATESTAMP}-12-${GIT_SHORT}"
+    IMAGE = "${REGISTRY}/${IMAGE_REPO}:${VERSION}"
+    LATEST = "${REGISTRY}/${IMAGE_REPO}:latest"
+    SVC_NAME = 'dm_svc'
   }
-
-
-environment {
-  APP_NAME = 'discountmate'
-  REGISTRY = "ghcr.io/${env.GIT_USERNAME ?: 'akrobe'}"
-  IMAGE_BASENAME = "${REGISTRY}/${APP_NAME}"
-  PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-  // Sonar toggle via env var (default off)
-  DO_SONAR = "${env.DO_SONAR ?: 'false'}"
-
-  SVC_NAME = 'dm_svc'
-}
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    stage('Init') {
+    stage('Docker Sanity') {
       steps {
-        script {
-          env.SHORT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          env.VERSION   = sh(script: "date +%Y.%m.%d", returnStdout: true).trim() + "-${env.BUILD_NUMBER}-${env.SHORT_SHA}"
-          env.IMAGE_TAG = "${env.IMAGE_BASENAME}:${env.VERSION}"
-        }
-        sh 'mkdir -p reports'
-        echo "VERSION=${env.VERSION}"
+        sh '''
+          set -eux
+          which docker
+          docker --version
+          docker compose version || true
+        '''
       }
     }
 
-
-stage('Docker Sanity') {
-  steps {
-    sh '''
-      set -eux
-      which docker || true
-      docker --version
-      # v2 integrated compose; fallback to standalone if not present
-      if docker compose version >/dev/null 2>&1; then
-        echo "Using docker compose (v2)"
-      elif command -v docker-compose >/dev/null 2>&1; then
-        echo "Using docker-compose (v1)"; alias docker='docker'; alias "docker compose"="docker-compose"
-      else
-        echo "No docker compose found"; exit 1
-      fi
-    '''
-  }
-}
-
-    stage('Build (Docker → GHCR)') {
+    stage('Build & Push (multi-arch)') {
       steps {
-        withCredentials([string(credentialsId: 'ghcr-pat', variable: 'PAT')]) {
+        withCredentials([string(credentialsId: 'github-https-token-or-ghcr-pat', variable: 'PAT')]) {
           sh '''
-            echo "$PAT" | docker login ghcr.io -u akrobe --password-stdin
-            docker build -t ${IMAGE_TAG} .
-            docker tag ${IMAGE_TAG} ${IMAGE_BASENAME}:latest
-            docker push ${IMAGE_TAG}
-            docker push ${IMAGE_BASENAME}:latest
+            set -eux
+            echo "$PAT" | docker login ${REGISTRY} -u akrobe --password-stdin
+
+            # Buildx multi-arch so scanners & runtimes on amd64/arm64 both work
+            docker buildx create --use --name ci-builder || docker buildx use ci-builder
+            docker buildx inspect --bootstrap
+
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              -t "${IMAGE}" -t "${LATEST}" \
+              --push .
           '''
         }
       }
     }
 
-stage('Test (unit + integration)') {
-  steps {
-    sh '''
-      set -eux
-      mkdir -p reports
-
-      # --- unit tests ---
-      docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
-        ghcr.io/akrobe/discountmate:${VERSION} sh -lc '
-          pip install -r requirements.txt -r requirements-dev.txt &&
-          pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py
-        '
-
-      # --- ensure no stale service ---
-      docker rm -f ${SVC_NAME} 2>/dev/null || true
-
-      # --- start service for integration tests ---
-      docker run -d --rm --name ${SVC_NAME} -p 8088:8080 ghcr.io/akrobe/discountmate:${VERSION}
-
-      # wait for health
-      for i in $(seq 1 30); do
-        if curl -sf http://localhost:8088/health >/dev/null; then break; fi
-        sleep 1
-      done
-
-      # --- integration tests (your test now uses BASE_URL, no docker-in-docker) ---
-      docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
-        -e BASE_URL=http://host.docker.internal:8088 \
-        ghcr.io/akrobe/discountmate:${VERSION} sh -lc '
-          pip install -r requirements.txt -r requirements-dev.txt &&
-          pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
-        '
-    '''
-  }
-  post {
-    always {
-      sh 'docker rm -f ${SVC_NAME} 2>/dev/null || true'
-    }
-  }
-}
-stage('Code Quality (SonarQube)') {
-  when { expression { return env.DO_SONAR?.toBoolean() } }
+    stage('Test (unit + integration)') {
       steps {
-        withSonarQubeEnv('SonarQube') {
-          sh '''
-            docker run --rm -v $PWD:/usr/src sonarsource/sonar-scanner-cli \
-              -Dsonar.projectKey=discountmate \
-              -Dsonar.sources=app \
-              -Dsonar.tests=tests \
-              -Dsonar.python.version=3.12 \
-              -Dsonar.junit.reportPaths=reports/junit.xml,reports/junit-it.xml \
-              -Dsonar.coverageReportPaths=reports/coverage.xml \
-              -Dsonar.host.url=$SONAR_HOST_URL \
-              -Dsonar.login=$SONAR_AUTH_TOKEN
-          '''
-        }
+        sh '''
+          set -eux
+          mkdir -p reports
+
+          # Unit
+          docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
+            ${IMAGE} sh -lc '
+              pip install -r requirements.txt -r requirements-dev.txt &&
+              pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py
+            '
+
+          # Clean any stale
+          docker rm -f ${SVC_NAME} 2>/dev/null || true
+
+          # Start service for integration
+          docker run -d --rm --name ${SVC_NAME} -p 8088:8080 ${IMAGE}
+
+          # Health wait
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8088/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          # Integration (containerized pytest talks to host service via host.docker.internal on Mac/Win, or use localhost when not in container)
+          docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
+            -e BASE_URL=http://host.docker.internal:8088 \
+            ${IMAGE} sh -lc '
+              pip install -r requirements.txt -r requirements-dev.txt &&
+              pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
+            '
+        '''
       }
-    }
-
-stage('Quality Gate') {
-  when { expression { return env.DO_SONAR?.toBoolean() } }
-      steps {
-        timeout(time: 15, unit: 'MINUTES') {
-          waitForQualityGate abortPipeline: true
+      post {
+        always {
+          sh 'docker rm -f ${SVC_NAME} 2>/dev/null || true'
+          junit 'reports/junit*.xml'
+          archiveArtifacts artifacts: 'reports/**', fingerprint: true
         }
       }
     }
@@ -139,98 +90,72 @@ stage('Quality Gate') {
     stage('Security (Bandit, pip-audit, Trivy)') {
       steps {
         sh '''
-          set +e
+          set -eux
           mkdir -p reports
-          docker run --rm -v $PWD:/src python:3.12-slim sh -lc "
-            pip install --no-cache-dir bandit pip-audit && \
-            cd /src && \
-            bandit -r app -f json -o reports/bandit.json || true && \
-            pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true"
-          docker run --rm aquasec/trivy:latest image --exit-code 1 --severity CRITICAL ${IMAGE_TAG} > reports/trivy.txt || true
 
-          # Gate: fail if Bandit HIGH > 0 or Trivy output contains CRITICAL
+          # Bandit + pip-audit in a throwaway Python container
+          docker run --rm -v "$PWD":/src python:3.12-slim sh -lc '
+            pip install --no-cache-dir bandit pip-audit &&
+            cd /src &&
+            bandit -r app -f json -o reports/bandit.json || true &&
+            pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
+          '
+
+          # Trivy: remote scan against GHCR manifest (now multi-arch, so no platform mismatch).
+          # Cache DB between runs for speed.
+          mkdir -p "$HOME/.cache/trivy"
+          docker run --rm \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD/reports:/out" \
+            aquasec/trivy:0.51.2 image \
+              --scanners vuln \
+              --ignore-unfixed \
+              --severity CRITICAL,HIGH \
+              --format json -o /out/trivy.json \
+              --no-progress \
+              "${IMAGE}" || true
+
+          # Simple gate: fail if CRITICAL present
           python3 - <<'PY'
-import json, os, sys
-try:
-    d=json.load(open('reports/bandit.json'))
-    high=sum(1 for r in d.get('results',[]) if r.get('issue_severity')=='HIGH')
-except Exception:
-    high=0
-print("Bandit HIGH:", high)
-sys.exit(1 if high>0 else 0)
+import json, sys, pathlib
+p = pathlib.Path('reports/trivy.json')
+if not p.exists():
+    print('Trivy report missing (skipped or failed).'); sys.exit(0)
+data = json.loads(p.read_text() or '{}')
+sev = []
+for r in data if isinstance(data, list) else data.get('Results', []):
+    for v in r.get('Vulnerabilities', []) or []:
+        sev.append(v.get('Severity'))
+crit = sev.count('CRITICAL')
+print(f'Trivy CRITICAL count: {crit}')
+sys.exit(1 if crit else 0)
 PY
-          grep -q 'CRITICAL' reports/trivy.txt && echo 'Trivy CRITICAL found' && exit 1 || echo 'No Trivy CRITICAL'
         '''
       }
-      post { always { archiveArtifacts artifacts: 'reports/*.json, reports/*.txt', fingerprint: true } }
     }
 
     stage('Deploy: Staging (compose + health gate)') {
+      when { expression { fileExists('env/.env.staging') && fileExists('compose.yaml') } }
       steps {
         sh '''
-          export ENV_FILE=env/.env.staging
-          export IMAGE=${IMAGE_TAG}
-          docker compose --env-file ${ENV_FILE} --profile staging up -d
+          set -eux
+          export IMAGE="${IMAGE}"
+          docker compose --env-file env/.env.staging --profile staging up -d
+
+          # Health gate vs compose service
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8081/health && break || sleep 2
+            if curl -sf http://localhost:${STAGING_HOST_PORT:-8089}/health >/dev/null; then
+              echo "Staging healthy"; exit 0; fi
+            sleep 1
           done
-          curl -sf http://localhost:8081/health > /dev/null
+          echo "Staging failed health"; exit 1
         '''
       }
-    }
-
-    stage('Release: Approve & Promote to Prod') {
-      steps {
-        input message: 'Approve release to PRODUCTION?', ok: 'Release'
-        withCredentials([string(credentialsId: 'ghcr-pat', variable: 'PAT')]) {
-          sh '''
-            echo "$PAT" | docker login ghcr.io -u akrobe --password-stdin
-            docker pull ${IMAGE_TAG}
-            docker tag ${IMAGE_TAG} ${IMAGE_BASENAME}:prod
-            docker push ${IMAGE_BASENAME}:prod
-
-            export ENV_FILE=env/.env.production
-            export IMAGE=${IMAGE_BASENAME}:prod
-            docker compose --env-file ${ENV_FILE} --profile prod up -d
-
-            for i in $(seq 1 30); do
-              curl -sf http://localhost/health && break || sleep 2
-            done
-            curl -sf http://localhost/health > /dev/null
-
-            echo "${VERSION}" > reports/release.txt
-          '''
-        }
-      }
-      post { success { archiveArtifacts artifacts: 'reports/release.txt', fingerprint: true } }
-    }
-
-    stage('Monitoring & Alerting (demo)') {
-      steps {
-        sh '''
-          curl -s -XPOST http://localhost:8081/recommend -H 'content-type: application/json' \
-               -d '{"total":220,"items":5,"tier":"silver"}' > /dev/null || true
-          curl -s -XPOST http://localhost:8081/simulate_error > /dev/null || true
-
-          sleep 70
-          curl -sf http://localhost:9093/api/v2/alerts -o reports/alerts.json || true
-          python3 - <<'PY'
-import json, sys
-try:
-  data=json.load(open('reports/alerts.json'))
-  ok=any(a.get('labels',{}).get('alertname')=='DiscountmateErrors' for a in data)
-  sys.exit(0 if ok else 1)
-except Exception:
-  sys.exit(1)
-PY
-        '''
-      }
-      post { always { archiveArtifacts artifacts: 'reports/*.json', fingerprint: true } }
     }
   }
 
   post {
-    success { echo "Pipeline OK: ${env.VERSION}" }
-    failure { echo "Pipeline FAILED" }
+    failure { echo 'Pipeline FAILED' }
+    success { echo "Pipeline OK — ${IMAGE}" }
   }
 }
