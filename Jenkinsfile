@@ -67,32 +67,45 @@ stage('Docker Sanity') {
       }
     }
 
-    stage('Test (unit + integration)') {
-      steps {
-        sh '''
-          set -eux
-          if [ -f requirements-dev.txt ] && [ -d tests ]; then
-            docker run --rm --name dm_unit ${IMAGE_TAG} \
-              sh -lc "pip install -r requirements-dev.txt && \
-                      pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py"
+   stage('Test (unit + integration)') {
+  steps {
+    sh '''
+      set -eux
+      mkdir -p reports
 
-            docker run -d --rm --name dm_svc -p 8088:8080 ${IMAGE_TAG}
-            sleep 3
-            docker run --rm --network=host -e TEST_IMAGE=${IMAGE_TAG} ${IMAGE_TAG} \
-              sh -lc "pip install -r requirements-dev.txt && \
-                      pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py"
-            docker stop dm_svc
-          else
-            echo "No tests yet; running smoke…"
-            docker run -d --rm --name dm_smoke -p 8088:8080 ${IMAGE_TAG}
-            sleep 3
-            curl -sf http://localhost:8088/health > /dev/null
-            docker stop dm_smoke
-          fi
-        '''
-      }
-      post { always { junit allowEmptyResults: true, testResults: 'reports/*.xml' } }
-    }
+      # ---- Unit tests (mount workspace so requirements-dev.txt & tests are visible) ----
+      if [ -f requirements-dev.txt ] && [ -d tests ]; then
+        docker run --rm -v "$PWD":/workspace -w /workspace ${IMAGE_TAG} \
+          sh -lc "pip install -r requirements-dev.txt && \
+                  pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py"
+      else
+        echo "No tests yet; skipping unit tests (will run smoke in integration block)…"
+      fi
+
+      # ---- Bring up the app for integration tests on host port 8088 ----
+      docker run -d --rm --name dm_svc -p 8088:8080 ${IMAGE_TAG}
+      # give it a moment
+      for i in $(seq 1 30); do curl -sf http://localhost:8088/health && break || sleep 1; done
+
+      # ---- Integration tests (hit the service via host port; use host.docker.internal inside container) ----
+      if [ -f requirements-dev.txt ] && [ -f tests/test_integration_api.py ]; then
+        docker run --rm -v "$PWD":/workspace -w /workspace -e BASE_URL=http://host.docker.internal:8088 ${IMAGE_TAG} \
+          sh -lc "pip install -r requirements-dev.txt && \
+                  pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py"
+      else
+        echo "No integration tests; doing smoke check instead…"
+        curl -sf http://localhost:8088/health > /dev/null
+        curl -sf -XPOST http://localhost:8088/recommend -H 'content-type: application/json' \
+             -d '{"total":220,"items":5,"tier":"silver"}' > /dev/null
+      fi
+
+      docker stop dm_svc
+    '''
+  }
+  post {
+    always { junit allowEmptyResults: true, testResults: 'reports/*.xml' }
+  }
+}
 
     stage('Code Quality (SonarQube)') {
       when { expression { return params.DO_SONAR } }
