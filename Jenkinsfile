@@ -154,7 +154,7 @@ stage('Code Quality (SonarQube)') {
       docker run -d --name sonarqube -p 9000:9000 sonarqube:lts-community
       for i in $(seq 1 60); do curl -sf http://localhost:9000/api/server/version && break || sleep 2; done
     '''
-    withCredentials([string(credentialsId: 'sonar_token', variable: 'SONAR_TOKEN')]) {
+    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
       sh '''
         docker run --rm -v "$WORKSPACE:/usr/src" sonarsource/sonar-scanner-cli:5 \
           -Dsonar.host.url=http://host.docker.internal:9000 \
