@@ -230,21 +230,25 @@ pipeline {
         }
       }
       steps {
-        sh """
+        script {
+          env.ENV_FILE   = 'env/.env.staging'
+          env.IMAGE_FULL = "${env.IMAGE}:${env.VERSION}"
+        }
+        sh '''
           set -eux
           mkdir -p env
-          [ -f env/.env.staging ] || echo "APP_PORT=8088" > env/.env.staging
+          [ -f "$ENV_FILE" ] || echo "APP_PORT=8088" > "$ENV_FILE"
 
-          export ENV_FILE=env/.env.staging
-          export IMAGE=${IMAGE}:${VERSION}
+          # make the full image name available to compose (if referenced)
+          export IMAGE="$IMAGE_FULL"
 
-          docker compose -f ${COMPOSE_FILE} --env-file "\\$ENV_FILE" up -d
+          docker compose -f ''' + env.COMPOSE_FILE + ''' --env-file "$ENV_FILE" up -d
 
           # Health gate on 8088
-          for i in \\(seq 1 30); do
+          for i in $(seq 1 30); do
             curl -sf http://localhost:8088/health && break || sleep 1
           done
-        """
+        '''
       }
     }
 
@@ -292,28 +296,28 @@ pipeline {
             }
           }
 
-          sh """
-            set -eux
-            mkdir -p env
-            [ -f env/.env.production ] || echo "APP_PORT=80" > env/.env.production
-
-            # Pull exact version built in this run, tag as :prod, push
-            docker pull ${IMAGE}:${VERSION}
-            docker tag  ${IMAGE}:${VERSION} ${IMAGE}:prod
-            docker push ${IMAGE}:prod
-
-            # Deploy JUST the app service to avoid monitoring mount issues
-            export ENV_FILE=env/.env.production
-            export IMAGE=${IMAGE}:${VERSION}
-
-            docker compose -f ${COMPOSE_FILE_PROD} --env-file "\\$ENV_FILE" --profile prod up -d discountmate
-
-            # Smoke test port 80
-            for i in \\(seq 1 30); do
-              curl -sf http://localhost/health && break || sleep 1
-            done
-          """
+          env.ENV_FILE   = 'env/.env.production'
+          env.IMAGE_FULL = "${env.IMAGE}:${env.VERSION}"
         }
+        sh '''
+          set -eux
+          mkdir -p env
+          [ -f "$ENV_FILE" ] || echo "APP_PORT=80" > "$ENV_FILE"
+
+          docker pull ''' + env.IMAGE + ':' + env.VERSION + '''
+          docker tag  ''' + env.IMAGE + ':' + env.VERSION + ' ' + env.IMAGE + ''':prod
+          docker push ''' + env.IMAGE + ''':prod
+
+          export IMAGE="$IMAGE_FULL"
+
+          # Deploy JUST the app service to avoid monitoring mount issues
+          docker compose -f ''' + env.COMPOSE_FILE_PROD + ''' --env-file "$ENV_FILE" --profile prod up -d discountmate
+
+          # Smoke test port 80
+          for i in $(seq 1 30); do
+            curl -sf http://localhost/health && break || sleep 1
+          done
+        '''
       }
     }
 
@@ -342,25 +346,26 @@ pipeline {
             }
           }
 
-          sh """
-            set -eux
-            mkdir -p env
-            [ -f env/.env.production ] || echo "APP_PORT=80" > env/.env.production
-
-            export ENV_FILE=env/.env.production
-            export IMAGE=${IMAGE}:${params.ROLLBACK_TO_VERSION}
-
-            docker pull ${IMAGE}
-
-            # Redeploy only the app service
-            docker compose -f ${COMPOSE_FILE_PROD} --env-file "\\$ENV_FILE" --profile prod up -d discountmate
-
-            # Smoke test port 80
-            for i in \\(seq 1 30); do
-              curl -sf http://localhost/health && break || sleep 1
-            done
-          """
+          env.ENV_FILE   = 'env/.env.production'
+          env.IMAGE_FULL = "${env.IMAGE}:${params.ROLLBACK_TO_VERSION}"
         }
+        sh '''
+          set -eux
+          mkdir -p env
+          [ -f "$ENV_FILE" ] || echo "APP_PORT=80" > "$ENV_FILE"
+
+          docker pull ''' + env.IMAGE + ':' + params.ROLLBACK_TO_VERSION + '''
+
+          export IMAGE="$IMAGE_FULL"
+
+          # Redeploy only the app service
+          docker compose -f ''' + env.COMPOSE_FILE_PROD + ''' --env-file "$ENV_FILE" --profile prod up -d discountmate
+
+          # Smoke test port 80
+          for i in $(seq 1 30); do
+            curl -sf http://localhost/health && break || sleep 1
+          done
+        '''
       }
     }
   }
