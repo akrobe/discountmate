@@ -14,6 +14,8 @@ environment {
 
   // Sonar toggle via env var (default off)
   DO_SONAR = "${env.DO_SONAR ?: 'false'}"
+
+  SVC_NAME = 'dm_svc'
 }
 
   stages {
@@ -66,46 +68,46 @@ stage('Docker Sanity') {
       }
     }
 
-   stage('Test (unit + integration)') {
+stage('Test (unit + integration)') {
   steps {
     sh '''
       set -eux
       mkdir -p reports
 
-      # ---- Unit tests (mount workspace so requirements-dev.txt & tests are visible) ----
-      if [ -f requirements-dev.txt ] && [ -d tests ]; then
-        docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace ${IMAGE_TAG} \
-  sh -lc "pip install -r requirements.txt -r requirements-dev.txt && \
-          pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py"
-      else
-        echo "No tests yet; skipping unit tests (will run smoke in integration block)…"
-      fi
+      # --- unit tests ---
+      docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
+        ghcr.io/akrobe/discountmate:${VERSION} sh -lc '
+          pip install -r requirements.txt -r requirements-dev.txt &&
+          pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py
+        '
 
-      # ---- Bring up the app for integration tests on host port 8088 ----
-      docker run -d --rm --name dm_svc -p 8088:8080 ${IMAGE_TAG}
-      # give it a moment
-      for i in $(seq 1 30); do curl -sf http://localhost:8088/health && break || sleep 1; done
+      # --- ensure no stale service ---
+      docker rm -f ${SVC_NAME} 2>/dev/null || true
 
-      # ---- Integration tests (hit the service via host port; use host.docker.internal inside container) ----
-      if [ -f requirements-dev.txt ] && [ -f tests/test_integration_api.py ]; then
-        docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace -e BASE_URL=http://host.docker.internal:8088 ${IMAGE_TAG} \
-  sh -lc "pip install -r requirements.txt -r requirements-dev.txt && \
-          pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py"
-      else
-        echo "No integration tests; doing smoke check instead…"
-        curl -sf http://localhost:8088/health > /dev/null
-        curl -sf -XPOST http://localhost:8088/recommend -H 'content-type: application/json' \
-             -d '{"total":220,"items":5,"tier":"silver"}' > /dev/null
-      fi
+      # --- start service for integration tests ---
+      docker run -d --rm --name ${SVC_NAME} -p 8088:8080 ghcr.io/akrobe/discountmate:${VERSION}
 
-      docker stop dm_svc
+      # wait for health
+      for i in $(seq 1 30); do
+        if curl -sf http://localhost:8088/health >/dev/null; then break; fi
+        sleep 1
+      done
+
+      # --- integration tests (your test now uses BASE_URL, no docker-in-docker) ---
+      docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
+        -e BASE_URL=http://host.docker.internal:8088 \
+        ghcr.io/akrobe/discountmate:${VERSION} sh -lc '
+          pip install -r requirements.txt -r requirements-dev.txt &&
+          pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
+        '
     '''
   }
   post {
-    always { junit allowEmptyResults: true, testResults: 'reports/*.xml' }
+    always {
+      sh 'docker rm -f ${SVC_NAME} 2>/dev/null || true'
+    }
   }
 }
-
 stage('Code Quality (SonarQube)') {
   when { expression { return env.DO_SONAR?.toBoolean() } }
       steps {
