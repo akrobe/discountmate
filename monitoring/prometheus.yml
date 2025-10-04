@@ -6,11 +6,17 @@ rule_files:
   - /etc/prometheus/alert.rules.yml
 
 scrape_configs:
-  - job_name: 'discountmate'
+  - job_name: "blackbox"
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
     static_configs:
       - targets:
-          - 'host.docker.internal:8088'  # staging
-          - 'host.docker.internal:80'    # production
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
+        - http://discountmate/health     # resolves via compose network
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
