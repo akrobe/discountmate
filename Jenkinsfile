@@ -8,6 +8,7 @@ pipeline {
   }
 
   parameters {
+     booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to staging after a successful push')
     booleanParam(name: 'DEPLOY_TO_PROD',    defaultValue: false, description: 'Enable the Prod release stage for this run')
     booleanParam(name: 'AUTO_APPROVE_PROD', defaultValue: false, description: 'Skip manual approval (no pause) when releasing to Prod')
     string(name: 'ROLLBACK_TO_VERSION', defaultValue: '', description: 'Optional: version to rollback to (e.g. 2025.10.04-26-39308f7)')
@@ -223,26 +224,47 @@ pipeline {
     }
 
     stage('Deploy: Staging (compose + health gate)') {
-  when { environment name: 'PUSHED', value: 'true' }
-  steps { /* unchanged */ }
+  when {
+    beforeAgent true
+    allOf {
+      expression { env.PUSHED?.trim() == 'true' }   // image was pushed
+      expression { params.DEPLOY_STAGING }          // user wants staging
+    }
+  }
+  steps {
+    // 👇 replace your /* unchanged */ with something like this:
+    sh """
+      set -eux
+      mkdir -p env
+      [ -f env/.env.staging ] || echo "APP_PORT=8088" > env/.env.staging
+
+      export ENV_FILE=env/.env.staging
+      export IMAGE=${IMAGE}:${VERSION}
+
+      docker compose -f ${COMPOSE_FILE} --env-file "$ENV_FILE" up -d
+
+      # Health gate on 8088
+      for i in \$(seq 1 30); do
+        curl -sf http://localhost:8088/health && break || sleep 1
+      done
+    """
+  }
 }
 
-    // ---------- Optional gated release to Prod (port 80)
-    stage('Approve Release') {
-      when {
-        expression { return params.DEPLOY_TO_PROD && !params.AUTO_APPROVE_PROD }
-      }
-      steps {
-        timeout(time: 2, unit: 'HOURS') {
-          input message: "Deploy ${env.VERSION} to PRODUCTION (port 80)?", ok: 'Release'
-        }
-      }
-    }
+stage('Gate Debug') {
+  steps {
+    echo "PUSHED=${env.PUSHED} DEPLOY_TO_PROD=${params.DEPLOY_TO_PROD} AUTO_APPROVE_PROD=${params.AUTO_APPROVE_PROD}"
+  }
+}
 
-    stage('Release: Prod') {
-      when {
-        expression { return params.DEPLOY_TO_PROD && env.PUSHED == 'true' }
-      }
+stage('Release: Prod') {
+  when {
+    beforeAgent true
+    allOf {
+      expression { env.PUSHED?.trim() == 'true' }
+      expression { params.DEPLOY_TO_PROD }   // <-- fix here
+    }
+  }
       steps {
         script {
           // Ensure we’re logged in to GHCR
@@ -288,7 +310,7 @@ pipeline {
     // ---------- One-click manual rollback
     stage('Rollback (manual)') {
       when {
-        expression { return params.ROLLBACK_TO_VERSION?.trim() }
+        expression { return params.ROLLBACK_TO_VERSION ?: '').trim() != '' }
       }
       steps {
         timeout(time: 2, unit: 'HOURS') {
