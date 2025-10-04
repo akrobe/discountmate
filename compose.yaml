@@ -1,0 +1,15 @@
+services:
+  api:
+    image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}
+    container_name: dm_staging
+    profiles: ["staging"]
+    ports:
+      - "${STAGING_HOST_PORT:-8089}:8080"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
