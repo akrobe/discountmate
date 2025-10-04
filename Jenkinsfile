@@ -310,7 +310,7 @@ stage('Release: Prod') {
     // ---------- One-click manual rollback
     stage('Rollback (manual)') {
       when {
-        expression { return params.ROLLBACK_TO_VERSION ?: '').trim() != '' }
+        expression { (params.ROLLBACK_TO_VERSION ?: '').trim() != '' }
       }
       steps {
         timeout(time: 2, unit: 'HOURS') {
