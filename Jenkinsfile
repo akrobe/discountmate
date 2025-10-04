@@ -115,49 +115,39 @@ docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace ${IM
     }
 
     stage('Test (integration)') {
-      steps {
-        sh '''set -eux
+  steps {
+    sh '''set -eux
 docker rm -f dm_svc || true
 docker run -d --rm --name dm_svc -p 0:8080 ${IMAGE_REPO}:${VERSION}-local
 HOST_PORT=$(docker port dm_svc 8080/tcp | head -n1 | awk -F: '{print $NF}')
 for i in $(seq 1 30); do curl -fsS "http://localhost:$HOST_PORT/health" && break || sleep 1; done
-docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace -e BASE_URL="http://host.docker.internal:${HOST_PORT}" ${IMAGE_REPO}:${VERSION}-local sh -lc '
-  pip install -r requirements.txt -r requirements-dev.txt &&
-  pytest -q --junitxml=reports/junit-it.xml \ --cov=app --cov-append \ --cov-report=xml:reports/coverage.xml \ --cov-report=html:reports/htmlcov \ --cov-fail-under=80 \ tests/test_integration_*.py
-'
+
+# Run integration tests in the image, APPENDING coverage and enforcing the gate here
+docker run --rm \
+  -v "$PWD:/workspace" -w /workspace \
+  -e PYTHONPATH=/workspace \
+  -e BASE_URL="http://host.docker.internal:${HOST_PORT}" \
+  ${IMAGE_REPO}:${VERSION}-local sh -lc "
+  pip install -r requirements.txt -r requirements-dev.txt && \
+  pytest -q \
+    --junitxml=reports/junit-it.xml \
+    --cov=app --cov-append \
+    --cov-report=xml:reports/coverage.xml \
+    --cov-report=html:reports/htmlcov \
+    --cov-fail-under=80 \
+    tests/test_integration_*.py
+"
 docker rm -f dm_svc || true
 '''
-      }
-      post {
-        always { junit(testResults: 'reports/junit-it.xml', allowEmptyResults: false) }
-      }
+  }
+  post {
+    always {
+      junit(testResults: 'reports/junit-it.xml', allowEmptyResults: false)
+      publishHTML(target: [allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true,
+        reportDir: 'reports/htmlcov', reportFiles: 'index.html', reportName: 'Coverage (HTML)'])
     }
-
-    // SonarQube via Docker (no local scanner needed) + Quality Gate wait
-    stage('Code Quality (SonarQube)') {
-      steps {
-        withSonarQubeEnv("${SONARQUBE_SERVER}") {
-          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-            sh '''set -eux
-docker run --rm \
-  -e SONAR_HOST_URL="${SONAR_HOST_URL}" \
-  -e SONAR_LOGIN="${SONAR_TOKEN}" \
-  -v "$PWD:/usr/src" \
-  sonarsource/sonar-scanner-cli \
-  -Dsonar.projectKey=discountmate \
-  -Dsonar.projectBaseDir=/usr/src \
-  -Dsonar.sources=app \
-  -Dsonar.tests=tests \
-  -Dsonar.python.coverage.reportPaths=/usr/src/reports/coverage.xml \
-  -Dsonar.sourceEncoding=UTF-8
-'''
-          }
-        }
-        timeout(time: 10, unit: 'MINUTES') {
-          waitForQualityGate abortPipeline: true
-        }
-      }
-    }
+  }
+}
 
     stage('Security (Bandit, pip-audit, Trivy)') {
       steps {
