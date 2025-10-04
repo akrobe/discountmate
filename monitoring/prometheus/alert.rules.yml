@@ -1,0 +1,11 @@
+groups:
+  - name: basic
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target down"
+          description: "The target {{ $labels.instance }} is down."
