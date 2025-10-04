@@ -1,23 +1,22 @@
 pipeline {
-  agent any
+  // Make sure your Jenkins node that has Docker & Compose is labeled "docker"
+  agent { label 'docker' }
+
   options {
     timestamps()
-    ansiColor('xterm')
+    // ansiColor removed to avoid "Invalid option type" error on instances without the plugin
   }
+
   environment {
     REGISTRY     = 'ghcr.io'
     IMAGE_REPO   = 'akrobe/discountmate'
     IMAGE        = "${REGISTRY}/${IMAGE_REPO}"
     COMPOSE_FILE = 'compose.yaml'
-    // Make sure your Jenkins has a Secret Text credential with an API token for GHCR.
-    // Update the credentialsId below if yours is named differently.
   }
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Init') {
@@ -26,11 +25,9 @@ pipeline {
           set -eux
           GIT_SHA=$(git rev-parse --short HEAD)
           DATE=$(date +%Y.%m.%d)
-          # Include Jenkins BUILD_NUMBER if present to keep tags unique and sortable
           VERSION="${DATE}-${BUILD_NUMBER:-0}-${GIT_SHA}"
           mkdir -p reports
           echo "VERSION=${VERSION}" | tee reports/version.txt
-          echo "VERSION=${VERSION}"
         '''
         script {
           env.VERSION = sh(returnStdout: true, script: "awk -F= '/^VERSION=/{print \$2}' reports/version.txt").trim()
@@ -45,6 +42,7 @@ pipeline {
           which docker
           docker --version
           docker version
+          docker compose version || { echo "Docker Compose v2 is required"; exit 1; }
           docker buildx version || true
         '''
       }
@@ -57,10 +55,8 @@ pipeline {
             set -eux
             echo "$PAT" | docker login ghcr.io -u akrobe --password-stdin
 
-            # Ensure buildx is available and a builder is selected
             docker buildx create --name dm_builder --use || docker buildx use dm_builder || true
 
-            # Build and push both arm64+amd64 so Trivy/any host can pull & scan
             docker buildx build \
               --platform linux/amd64,linux/arm64 \
               -t ${IMAGE}:${VERSION} \
@@ -100,15 +96,14 @@ pipeline {
         sh '''
           set -eux
           docker rm -f dm_svc || true
-          # Run the built image and wait for health
+
           APP_PORT=8088
           docker run -d --rm --name dm_svc -p ${APP_PORT}:8080 ${IMAGE}:${VERSION}
+
           for i in $(seq 1 30); do
             curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1
           done
 
-          # Run the tests in a container mounting the workspace.
-          # host.docker.internal resolves on Docker Desktop (macOS/Windows) and most recent Docker on Linux.
           docker run --rm \
             -v "$WORKSPACE":/workspace -w /workspace \
             -e PYTHONPATH=/workspace \
@@ -134,7 +129,6 @@ pipeline {
           set +e
           mkdir -p reports
 
-          # Static/code deps security in a throwaway container
           docker run --rm -v "$WORKSPACE":/src python:3.12-slim sh -lc '
             pip install --no-cache-dir bandit pip-audit >/dev/null 2>&1 && \
             cd /src && \
@@ -142,8 +136,6 @@ pipeline {
             pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
           '
 
-          # Trivy against the pushed, multi-arch image. Force a platform to be deterministic.
-          # We let Trivy set exit code 1 only when CRITICAL vulns exist; still save the report either way.
           docker run --rm aquasec/trivy:latest image \
             --platform linux/amd64 \
             --scanners vuln \
@@ -154,9 +146,7 @@ pipeline {
           TRIVY_CODE=${PIPESTATUS[0]}
 
           python3 - <<'PY'
-import json, sys, pathlib
-p = pathlib.Path("reports"); p.mkdir(parents=True, exist_ok=True)
-print("Bandit HIGH:", 0)  # keep old summary line to match previous logs if you like
+print("Bandit HIGH:", 0)
 PY
 
           if [ "$TRIVY_CODE" -eq 1 ]; then
@@ -179,12 +169,9 @@ PY
           export ENV_FILE=env/.env.staging
           [ -f "${ENV_FILE}" ] || (echo "Missing ${ENV_FILE}" && exit 1)
 
-          # Pass IMAGE to compose so staging deploys the exact build we just pushed
           export IMAGE=${IMAGE}:${VERSION}
-
           docker compose -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile staging up -d
 
-          # Health gate
           . ${ENV_FILE}
           PORT=${APP_PORT:-8088}
           for i in $(seq 1 30); do
@@ -196,14 +183,8 @@ PY
   }
 
   post {
-    success {
-      echo "✅ Pipeline PASSED. Image: ${env.IMAGE}:${env.VERSION}"
-    }
-    failure {
-      echo "❌ Pipeline FAILED"
-    }
-    always {
-      archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false
-    }
+    success { echo "✅ Pipeline PASSED. Image: ${env.IMAGE}:${env.VERSION}" }
+    failure { echo "❌ Pipeline FAILED" }
+    always  { archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false }
   }
 }
