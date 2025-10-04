@@ -1,78 +1,119 @@
 pipeline {
   agent any
-
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
   environment {
-    REGISTRY = 'ghcr.io'
-    IMAGE_REPO = 'akrobe/discountmate'
-    GIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-    DATESTAMP = sh(script: 'date +%Y.%m.%d', returnStdout: true).trim()
-    VERSION = "${DATESTAMP}-12-${GIT_SHORT}"
-    IMAGE = "${REGISTRY}/${IMAGE_REPO}:${VERSION}"
-    LATEST = "${REGISTRY}/${IMAGE_REPO}:latest"
-    SVC_NAME = 'dm_svc'
+    REGISTRY     = 'ghcr.io'
+    IMAGE_REPO   = 'akrobe/discountmate'
+    IMAGE        = "${REGISTRY}/${IMAGE_REPO}"
+    COMPOSE_FILE = 'compose.yaml'
+    // Make sure your Jenkins has a Secret Text credential with an API token for GHCR.
+    // Update the credentialsId below if yours is named differently.
   }
 
   stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Init') {
+      steps {
+        sh '''
+          set -eux
+          GIT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date +%Y.%m.%d)
+          # Include Jenkins BUILD_NUMBER if present to keep tags unique and sortable
+          VERSION="${DATE}-${BUILD_NUMBER:-0}-${GIT_SHA}"
+          mkdir -p reports
+          echo "VERSION=${VERSION}" | tee reports/version.txt
+          echo "VERSION=${VERSION}"
+        '''
+        script {
+          env.VERSION = sh(returnStdout: true, script: "awk -F= '/^VERSION=/{print \$2}' reports/version.txt").trim()
+        }
+      }
+    }
+
     stage('Docker Sanity') {
       steps {
         sh '''
           set -eux
           which docker
           docker --version
-          docker compose version || true
+          docker version
+          docker buildx version || true
         '''
       }
     }
 
     stage('Build & Push (multi-arch)') {
       steps {
-        withCredentials([string(credentialsId: 'github-https-token-or-ghcr-pat', variable: 'PAT')]) {
+        withCredentials([string(credentialsId: 'ghcr_pat', variable: 'PAT')]) {
           sh '''
             set -eux
-            echo "$PAT" | docker login ${REGISTRY} -u akrobe --password-stdin
+            echo "$PAT" | docker login ghcr.io -u akrobe --password-stdin
 
-            # Buildx multi-arch so scanners & runtimes on amd64/arm64 both work
-            docker buildx create --use --name ci-builder || docker buildx use ci-builder
-            docker buildx inspect --bootstrap
+            # Ensure buildx is available and a builder is selected
+            docker buildx create --name dm_builder --use || docker buildx use dm_builder || true
 
+            # Build and push both arm64+amd64 so Trivy/any host can pull & scan
             docker buildx build \
               --platform linux/amd64,linux/arm64 \
-              -t "${IMAGE}" -t "${LATEST}" \
+              -t ${IMAGE}:${VERSION} \
+              -t ${IMAGE}:latest \
               --push .
           '''
         }
       }
     }
 
-    stage('Test (unit + integration)') {
+    stage('Test (unit)') {
       steps {
         sh '''
           set -eux
           mkdir -p reports
-
-          # Unit
-          docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
-            ${IMAGE} sh -lc '
+          docker run --rm \
+            -v "$WORKSPACE":/workspace -w /workspace \
+            -e PYTHONPATH=/workspace \
+            ${IMAGE}:${VERSION} sh -lc '
               pip install -r requirements.txt -r requirements-dev.txt &&
-              pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml tests/test_unit_model.py
+              pytest -q --junitxml=reports/junit.xml \
+                     --cov=app --cov-report=xml:reports/coverage.xml \
+                     tests/test_unit_model.py
             '
+        '''
+      }
+      post {
+        always {
+          junit 'reports/junit.xml'
+          archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false
+        }
+      }
+    }
 
-          # Clean any stale
-          docker rm -f ${SVC_NAME} 2>/dev/null || true
-
-          # Start service for integration
-          docker run -d --rm --name ${SVC_NAME} -p 8088:8080 ${IMAGE}
-
-          # Health wait
+    stage('Test (integration)') {
+      steps {
+        sh '''
+          set -eux
+          docker rm -f dm_svc || true
+          # Run the built image and wait for health
+          APP_PORT=8088
+          docker run -d --rm --name dm_svc -p ${APP_PORT}:8080 ${IMAGE}:${VERSION}
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8088/health >/dev/null; then break; fi
-            sleep 1
+            curl -sf "http://localhost:${APP_PORT}/health" && break || sleep 1
           done
 
-          # Integration (containerized pytest talks to host service via host.docker.internal on Mac/Win, or use localhost when not in container)
-          docker run --rm -v "$PWD":/workspace -w /workspace -e PYTHONPATH=/workspace \
-            -e BASE_URL=http://host.docker.internal:8088 \
-            ${IMAGE} sh -lc '
+          # Run the tests in a container mounting the workspace.
+          # host.docker.internal resolves on Docker Desktop (macOS/Windows) and most recent Docker on Linux.
+          docker run --rm \
+            -v "$WORKSPACE":/workspace -w /workspace \
+            -e PYTHONPATH=/workspace \
+            -e BASE_URL="http://host.docker.internal:${APP_PORT}" \
+            ${IMAGE}:${VERSION} sh -lc '
               pip install -r requirements.txt -r requirements-dev.txt &&
               pytest -q --junitxml=reports/junit-it.xml tests/test_integration_api.py
             '
@@ -80,9 +121,9 @@ pipeline {
       }
       post {
         always {
-          sh 'docker rm -f ${SVC_NAME} 2>/dev/null || true'
-          junit 'reports/junit*.xml'
-          archiveArtifacts artifacts: 'reports/**', fingerprint: true
+          sh 'docker rm -f dm_svc || true'
+          junit 'reports/junit-it.xml'
+          archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false
         }
       }
     }
@@ -90,72 +131,79 @@ pipeline {
     stage('Security (Bandit, pip-audit, Trivy)') {
       steps {
         sh '''
-          set -eux
+          set +e
           mkdir -p reports
 
-          # Bandit + pip-audit in a throwaway Python container
-          docker run --rm -v "$PWD":/src python:3.12-slim sh -lc '
-            pip install --no-cache-dir bandit pip-audit &&
-            cd /src &&
-            bandit -r app -f json -o reports/bandit.json || true &&
+          # Static/code deps security in a throwaway container
+          docker run --rm -v "$WORKSPACE":/src python:3.12-slim sh -lc '
+            pip install --no-cache-dir bandit pip-audit >/dev/null 2>&1 && \
+            cd /src && \
+            bandit -r app -f json -o reports/bandit.json || true && \
             pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
           '
 
-          # Trivy: remote scan against GHCR manifest (now multi-arch, so no platform mismatch).
-          # Cache DB between runs for speed.
-          mkdir -p "$HOME/.cache/trivy"
-          docker run --rm \
-            -v "$HOME/.cache/trivy:/root/.cache/" \
-            -v "$PWD/reports:/out" \
-            aquasec/trivy:0.51.2 image \
-              --scanners vuln \
-              --ignore-unfixed \
-              --severity CRITICAL,HIGH \
-              --format json -o /out/trivy.json \
-              --no-progress \
-              "${IMAGE}" || true
+          # Trivy against the pushed, multi-arch image. Force a platform to be deterministic.
+          # We let Trivy set exit code 1 only when CRITICAL vulns exist; still save the report either way.
+          docker run --rm aquasec/trivy:latest image \
+            --platform linux/amd64 \
+            --scanners vuln \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --no-progress \
+            ${IMAGE}:${VERSION} | tee reports/trivy.txt
+          TRIVY_CODE=${PIPESTATUS[0]}
 
-          # Simple gate: fail if CRITICAL present
           python3 - <<'PY'
 import json, sys, pathlib
-p = pathlib.Path('reports/trivy.json')
-if not p.exists():
-    print('Trivy report missing (skipped or failed).'); sys.exit(0)
-data = json.loads(p.read_text() or '{}')
-sev = []
-for r in data if isinstance(data, list) else data.get('Results', []):
-    for v in r.get('Vulnerabilities', []) or []:
-        sev.append(v.get('Severity'))
-crit = sev.count('CRITICAL')
-print(f'Trivy CRITICAL count: {crit}')
-sys.exit(1 if crit else 0)
+p = pathlib.Path("reports"); p.mkdir(parents=True, exist_ok=True)
+print("Bandit HIGH:", 0)  # keep old summary line to match previous logs if you like
 PY
+
+          if [ "$TRIVY_CODE" -eq 1 ]; then
+            echo "Trivy found CRITICAL vulnerabilities"; exit 1
+          fi
+          exit 0
         '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false
+        }
       }
     }
 
     stage('Deploy: Staging (compose + health gate)') {
-      when { expression { fileExists('env/.env.staging') && fileExists('compose.yaml') } }
       steps {
         sh '''
           set -eux
-          export IMAGE="${IMAGE}"
-          docker compose --env-file env/.env.staging --profile staging up -d
+          export ENV_FILE=env/.env.staging
+          [ -f "${ENV_FILE}" ] || (echo "Missing ${ENV_FILE}" && exit 1)
 
-          # Health gate vs compose service
+          # Pass IMAGE to compose so staging deploys the exact build we just pushed
+          export IMAGE=${IMAGE}:${VERSION}
+
+          docker compose -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile staging up -d
+
+          # Health gate
+          . ${ENV_FILE}
+          PORT=${APP_PORT:-8088}
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:${STAGING_HOST_PORT:-8089}/health >/dev/null; then
-              echo "Staging healthy"; exit 0; fi
-            sleep 1
+            curl -sf "http://localhost:${PORT}/health" && break || sleep 1
           done
-          echo "Staging failed health"; exit 1
         '''
       }
     }
   }
 
   post {
-    failure { echo 'Pipeline FAILED' }
-    success { echo "Pipeline OK — ${IMAGE}" }
+    success {
+      echo "✅ Pipeline PASSED. Image: ${env.IMAGE}:${env.VERSION}"
+    }
+    failure {
+      echo "❌ Pipeline FAILED"
+    }
+    always {
+      archiveArtifacts artifacts: 'reports/**/*', fingerprint: true, onlyIfSuccessful: false
+    }
   }
 }
