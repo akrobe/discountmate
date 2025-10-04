@@ -183,3 +183,7 @@ cython_debug/
 # CI reports and local env overrides
 reports/
 env/*.local
+
+env/*
+!.env
+!env/.env.staging
