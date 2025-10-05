@@ -310,28 +310,35 @@ echo "Alertmanager host port=${AM_PORT}"
 # wait for Prometheus HTTP ready
 for i in $(seq 1 60); do curl -sf http://localhost:9090/-/ready && break || sleep 1; done
 
-# wait until at least ONE active target is present
-for i in $(seq 1 60); do
-  n=$(curl -sf http://localhost:9090/api/v1/targets | jq '.data.activeTargets | length')
-  [ "$n" -ge 1 ] && break || sleep 1
+# wait specifically for the blackbox target to be UP (health can be 'unknown' for a few scrapes)
+for i in $(seq 1 90); do
+  if curl -sf http://localhost:9090/api/v1/targets \
+     | jq -e '.data.activeTargets[] | select(.labels.job=="blackbox-http" and .health=="up")' >/dev/null; then
+    echo "blackbox-http target is UP"
+    break
+  fi
+  sleep 1
 done
 
-# show targets quickly for visibility
-curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health, scrapeUrl: .scrapeUrl}'
-
-# ensure blackbox scrape target is up (Prom ⇄ Blackbox works)
+# show targets for visibility
 curl -s http://localhost:9090/api/v1/targets \
- | jq -e '.data.activeTargets[] | select(.labels.job=="blackbox-http" and .health=="up")' >/dev/null
+  | jq '.data.activeTargets[] | {job: .labels.job, health: .health, scrapeUrl: .scrapeUrl}'
 
 # ---- Simulate outage -> see alert fire ----
 docker compose -f docker-compose.yml --env-file env/.env.production --profile prod stop discountmate || true
-sleep 45
+sleep 10   # small buffer so probe fails soon
 
-# expect the AppDown alert
-curl -s "http://localhost:${AM_PORT}/api/v2/alerts" \
- | jq -e '.[] | select(.labels.alertname=="AppDown")' >/dev/null || echo "Warning: expected alert not found"
+# wait up to ~60s for the AppDown alert to show up in Alertmanager
+for i in $(seq 1 30); do
+  if curl -s "http://localhost:${AM_PORT}/api/v2/alerts" \
+       | jq -e '.[] | select(.labels.alertname=="AppDown")' >/dev/null; then
+    echo "AppDown alert observed"
+    break
+  fi
+  sleep 2
+done
 
-# recover
+# recover the app
 docker compose -f docker-compose.yml --env-file env/.env.production --profile prod up -d discountmate
 '''
     }
