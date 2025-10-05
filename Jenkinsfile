@@ -299,31 +299,35 @@ curl -sf "http://localhost:${APP_PORT}/health" || {
   steps {
     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
       sh '''set -eux
-# bring up monitoring with random Alertmanager port
+
+# bring up monitoring with a random Alertmanager host port (avoids clashes)
 ALERTMGR_PORT=0 docker compose -f docker-compose.monitoring.yml --profile monitoring up -d
 
 # discover the published AM port
 AM_PORT="$(docker compose -f docker-compose.monitoring.yml port alerts 9093 | awk -F: '{print $NF}')"
+echo "Alertmanager host port=${AM_PORT}"
 
-# wait for Prom + AM
+# wait for Prometheus HTTP ready
 for i in $(seq 1 60); do curl -sf http://localhost:9090/-/ready && break || sleep 1; done
-for i in $(seq 1 60); do curl -sf "http://localhost:${AM_PORT}/api/v2/status" && break || sleep 1; done
 
-# all targets health
-curl -s http://localhost:9090/api/v1/targets | jq -r '
-  .data.activeTargets | [.[].health] as $h
-  | "up=" + ([$h[]|select(.=="up")]|length|tostring) + " " +
-    "down=" + ([$h[]|select(.=="down")]|length|tostring)'
+# wait until at least ONE active target is present
+for i in $(seq 1 60); do
+  n=$(curl -sf http://localhost:9090/api/v1/targets | jq '.data.activeTargets | length')
+  [ "$n" -ge 1 ] && break || sleep 1
+done
 
-# ensure blackbox-http job is up
+# show targets quickly for visibility
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health, scrapeUrl: .scrapeUrl}'
+
+# ensure blackbox scrape target is up (Prom ⇄ Blackbox works)
 curl -s http://localhost:9090/api/v1/targets \
  | jq -e '.data.activeTargets[] | select(.labels.job=="blackbox-http" and .health=="up")' >/dev/null
 
-# simulate outage
+# ---- Simulate outage -> see alert fire ----
 docker compose -f docker-compose.yml --env-file env/.env.production --profile prod stop discountmate || true
 sleep 45
 
-# expect AppDown
+# expect the AppDown alert
 curl -s "http://localhost:${AM_PORT}/api/v2/alerts" \
  | jq -e '.[] | select(.labels.alertname=="AppDown")' >/dev/null || echo "Warning: expected alert not found"
 
