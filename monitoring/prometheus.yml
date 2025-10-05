@@ -1,27 +1,31 @@
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alerts:9093']          # Alertmanager by service name
 
 rule_files:
-  - /etc/prometheus/alert.rules.yml
+  - /etc/prometheus/alert.rules.yml          # matches your file name
 
 scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['prom:9090']               # Prometheus sees itself as "prom"
+
   - job_name: 'blackbox-http'
     metrics_path: /probe
     params:
       module: [http_2xx]
     static_configs:
       - targets:
-          - http://discountmate:8082/health   # prod port your pipeline uses
+          - http://discountmate:8082/health  # your prod service+port on the same network
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
       - target_label: __address__
-        replacement: blackbox:9115
+        replacement: blackbox:9115           # blackbox by service name
       - source_labels: [__param_target]
         target_label: instance
-
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ['alerts:9093']
