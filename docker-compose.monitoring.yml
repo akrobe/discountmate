@@ -1,3 +1,10 @@
+version: "3.9"
+
+networks:
+  dmnet:
+    external: true
+    name: discountmate_default
+
 services:
   prom:
     image: prom/prometheus:v2.54.1
@@ -16,10 +23,10 @@ services:
 
   blackbox:
     image: prom/blackbox-exporter:v0.25.0
+    command: ["--config.file=/etc/blackbox_exporter/config.yml"]
     volumes:
       - ./monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
-    ports:
-      - "9115:9115"
+    # IMPORTANT: do NOT publish 9115 to host; Prom talks over dmnet
     networks: [dmnet]
 
   alerts:
@@ -28,10 +35,8 @@ services:
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     ports:
-      - "9093:9093"   # if port clashes, use "9094:9093" temporarily
+      - target: 9093
+        published: ${ALERTMGR_PORT:-0}   # 0 => random free host port
+        protocol: tcp
+        mode: host
     networks: [dmnet]
-
-networks:
-  dmnet:
-    external: true
-    name: discountmate_default   # must match your app's network name
