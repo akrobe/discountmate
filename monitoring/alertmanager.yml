@@ -1,20 +1,8 @@
 route:
-  receiver: "stdout"
+  receiver: devnull
   group_by: ["alertname"]
   group_wait: 10s
   repeat_interval: 2h
-  routes:
-    - matchers:
-      - severity="critical"
-      receiver: "stdout"
 
 receivers:
-  - name: "stdout"
-    webhook_configs:
-      - url: "http://blackbox:9115"  # placeholder; prints 200 in logs
-# To use Slack, replace receiver above with:
-#  - name: "slack"
-#    slack_configs:
-#      - send_resolved: true
-#        api_url: "${SLACK_WEBHOOK_URL}"
-#        channel: "#alerts"
+  - name: devnull
