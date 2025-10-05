@@ -1,18 +1,15 @@
-version: "3.9"
-
+# docker-compose.yml  (only the app bits shown)
 services:
-  grafana:
-    image: grafana/grafana:latest
-    ports: ["3000:3000"]
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-    profiles: ["monitoring","prod"]
-    restart: unless-stopped
-
   discountmate:
     image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}
-    container_name: discountmate
+    # REMOVE this line if present:
+    # container_name: discountmate
     ports:
-      - "${APP_PORT:-8081}:8080"   # host:container — 8081 host, 8080 in container
-    profiles: ["staging","prod"]
-    restart: unless-stopped
+      - "${APP_PORT:-8081}:8080"
+    profiles: ["staging","prod"]     # allow both profiles
+    networks: [dmnet]
+
+networks:
+  dmnet:
+    external: true
+    name: discountmate_default
