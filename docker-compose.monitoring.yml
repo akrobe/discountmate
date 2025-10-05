@@ -26,3 +26,8 @@ services:
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     ports: ["9093:9093"]
+
+    networks:
+  default:
+    external: true
+    name: discountmate_default
