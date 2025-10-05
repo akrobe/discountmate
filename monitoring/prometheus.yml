@@ -6,17 +6,22 @@ rule_files:
   - /etc/prometheus/alert.rules.yml
 
 scrape_configs:
-  - job_name: "blackbox"
+  - job_name: 'blackbox-http'
     metrics_path: /probe
     params:
       module: [http_2xx]
     static_configs:
       - targets:
-        - http://discountmate/health     # resolves via compose network
+          - http://discountmate:8082/health   # <-- inside the shared network
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
       - target_label: __address__
         replacement: blackbox:9115
+      - source_labels: [__param_target]
+        target_label: instance
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alerts:9093']
