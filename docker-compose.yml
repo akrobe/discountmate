@@ -1,22 +1,6 @@
+version: "3.9"
+
 services:
-  prometheus:
-    image: prom/prometheus:latest
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
-    command: ["--config.file=/etc/prometheus/prometheus.yml"]
-    ports: ["9090:9090"]
-    profiles: ["monitoring","prod"]
-    restart: unless-stopped
-
-  alertmanager:
-    image: prom/alertmanager:latest
-    volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    ports: ["9093:9093"]
-    profiles: ["monitoring","prod"]
-    restart: unless-stopped
-
   grafana:
     image: grafana/grafana:latest
     ports: ["3000:3000"]
@@ -29,5 +13,6 @@ services:
     image: ${IMAGE:-ghcr.io/akrobe/discountmate:latest}
     container_name: discountmate
     ports:
-      - "${APP_PORT:-8081}:8080"   # host:container — 8081 on host, 8080 in container
+      - "${APP_PORT:-8081}:8080"   # host:container — 8081 host, 8080 in container
     profiles: [staging]
+    restart: unless-stopped
