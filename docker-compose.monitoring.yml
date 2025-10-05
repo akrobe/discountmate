@@ -1,9 +1,10 @@
-version: "3.9"
+# (optional) remove the 'version:' key to avoid the compose warning
+# version: "3.9"
 
 networks:
   dmnet:
     external: true
-    name: discountmate_default
+    name: discountmate_default   # must already exist (prod compose creates it)
 
 services:
   prom:
@@ -15,10 +16,8 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
     ports:
-      - "9090:9090"
-    depends_on:
-      - blackbox
-      - alerts
+      - "9090:9090"                 # keep fixed for the UI
+    depends_on: [blackbox, alerts]
     networks: [dmnet]
 
   blackbox:
@@ -26,7 +25,7 @@ services:
     command: ["--config.file=/etc/blackbox_exporter/config.yml"]
     volumes:
       - ./monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
-    # IMPORTANT: do NOT publish 9115 to host; Prom talks over dmnet
+    # Do NOT publish a host port; Prom scrapes via the Docker network
     networks: [dmnet]
 
   alerts:
@@ -34,9 +33,9 @@ services:
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    # Publish Alertmanager on a random free host port to avoid 9093 clashes
     ports:
       - target: 9093
-        published: ${ALERTMGR_PORT:-0}   # 0 => random free host port
+        published: ${ALERTMGR_PORT:-0}   # set ALERTMGR_PORT=9094 if you want a fixed host port
         protocol: tcp
-        mode: host
     networks: [dmnet]
