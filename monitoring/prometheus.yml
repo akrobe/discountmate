@@ -5,15 +5,15 @@ global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['alerts:9093']          # Alertmanager by service name
+        - targets: ['alerts:9093']
 
 rule_files:
-  - /etc/prometheus/alert.rules.yml          # matches your file name
+  - /etc/prometheus/alert.rules.yml
 
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
-      - targets: ['prom:9090']               # Prometheus sees itself as "prom"
+      - targets: ['prom:9090']
 
   - job_name: 'blackbox-http'
     metrics_path: /probe
@@ -21,11 +21,11 @@ scrape_configs:
       module: [http_2xx]
     static_configs:
       - targets:
-          - http://discountmate:8082/health  # your prod service+port on the same network
+          - http://discountmate:8080/health   # <-- container port
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
-      - target_label: __address__
-        replacement: blackbox:9115           # blackbox by service name
       - source_labels: [__param_target]
         target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
